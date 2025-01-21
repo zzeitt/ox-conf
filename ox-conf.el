@@ -30,33 +30,33 @@
 ;;       ox-conf.el doesn't support creating the page from scratch,
 ;;       instead it updates an existing page when exporting.)
 ;;   - Org file:
-;;     - Add `#+CONF_ID' and `#+CONF_SPACE' at the top of the .org file
+;;     - Add ~#+CONF_ID~ and ~#+CONF_SPACE~ at the top of the .org file
 ;;       you want to export.
 ;;   - Emacs init:
-;;     - Install `ox-conf.el'...
-;;     - Specify `org-conf-url' according to your host URL in your init file (e.g. init.el).
-;;     - Specify `org-conf-jira-chart-server' according to your case.
+;;     - Install =ox-conf.el=...
+;;     - Specify ~org-conf-url~ according to your host URL in your init file (e.g. =init.el=).
+;;     - Specify ~org-conf-jira-chart-server~ according to your case.
 ;;       - Ref: https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html
-;;     - Specify `org-conf-jria-chart-server-id' according to your case.
+;;     - Specify ~org-conf-jria-chart-server-id~ according to your case.
 ;; 
 ;; Exporting:
 ;;   - Wake up org-export dispatch.
-;;   - Press `f f' for exporting to the CONF_PAGE you provided.
+;;   - Press ~f f~ for exporting to the CONF_PAGE you provided.
 ;;
 ;; Options:
-;;   - `f b': "To buffer" org-conf-export-to-buffer
-;;   - `f p': "Page info" org-conf-export-page-info
-;;   - `f i': "Image info" org-conf-export-img-info
-;;   - `f f': "To Confluence" org-conf-export-to-conf
-;;   - `f w': "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
-;;   - `f r': "Forget the wrong password" org-conf-forget-password
+;;   - ~f b~: "To buffer" org-conf-export-to-buffer
+;;   - ~f p~: "Page info" org-conf-export-page-info
+;;   - ~f i~: "Image info" org-conf-export-img-info
+;;   - ~f f~: "To Confluence" org-conf-export-to-conf
+;;   - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
+;;   - ~f r~: "Forget the wrong password" org-conf-forget-password
 ;;
 ;; Response:
-;;   - Once exported successfully, yout will get `PUT SUCCEED' response.
+;;   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
 ;;
 ;; Note:
-;;   Most of the codes in this file are adapted from ox-html.el.
-;;   Part of the codes are inspired by org-jira.el.
+;;   Most of the codes in this file are adapted from =ox-html.el=.
+;;   Part of the codes are inspired by =org-jira.el=.
 
 ;;; Code:
 
