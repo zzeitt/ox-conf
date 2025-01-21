@@ -126,7 +126,7 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
     ))
 
 (define-skeleton ske-conf
-  "Quick insert ox-confluence options."
+  "Quick insert the required options."
   nil
   "#+CONF_SPACE: " (skeleton-read "Your conf space: ") \n
   "#+CONF_PAGE: " (setq v1 (skeleton-read "Your conf page url: ")) \n
@@ -595,8 +595,8 @@ information."
       )))
 
 (defun org-conf-rest-put (user conf-id title conf-space body version ver-msg)
-  (let* ((request-log-level ox-conf-log-level)
-         (request-message-level ox-conf-log-level))
+  (let* ((request-log-level org-conf-log-level)
+         (request-message-level org-conf-log-level))
     (request-response-data
      (request
        (org-conf--return-api-url (format "/rest/api/content/%s" conf-id))
@@ -645,8 +645,8 @@ information."
       )))
 
 (defun org-conf-rest-post-file (user conf-id filepath &optional attach-id)
-  (let* ((request-log-level ox-conf-log-level)
-         (request-message-level ox-conf-log-level))
+  (let* ((request-log-level org-conf-log-level)
+         (request-message-level org-conf-log-level))
     (request-response-data
      (request
        (if attach-id
