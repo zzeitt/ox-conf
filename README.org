@@ -1,0 +1,157 @@
+# -*- org-confirm-babel-evaluate: nil; eval: (org-sbe "startup-block"); -*-
+#+title: org-conf
+#+author: zeit
+#+date: <2025-01-20 Mon 16:44:24>
+#+startup: latexpreview show2level
+#+export_exclude_tags: noexport
+#+property: HEADER-ARGS+ :eval no-export
+#+options: ^:{}
+Last updated Time-stamp: <2025-01-21 14:27:24>
+# ===================================================================================
+# Hints:
+#   - Run M-x org-capture a to update the commentary in ox-conf.el.
+# ===================================================================================
+* _Startup Block_                                                  :noexport:
+#+name: startup-block
+#+begin_src elisp :results silent
+  ;; ------------------------------------------------------------------
+  ; Format time-stamp.
+  (setq-local time-stamp-format "%Y-%02m-%02d %02H:%02M:%02S")
+
+  ;; ------------------------------------------------------------------
+  ; Define functions.
+  (defun get-comment ()
+    "Function to get the commentary part of 'ox-conf.el' file."
+    (let ((_ret nil))
+      (with-temp-buffer
+        (insert-file-contents "./ox-conf.el")
+        (setq _ret
+              (buffer-substring-no-properties
+               (re-search-forward ";;; Commentary:.*\n\n")
+               (re-search-forward "\n;;; Code:")
+               )
+              )
+        )
+      (setq _ret (replace-regexp-in-string "\n;;; Code:" "" _ret))
+      (setq _ret (replace-regexp-in-string "^;; ?" "" _ret))
+      )
+    )
+
+  (defun ox-conf-capture--hook (&optional sec-name)
+    "Hook function that runs after capture. Source code borrowed from
+  https://emacs.stackexchange.com/a/38354/38412."
+    (with-current-buffer (buffer-name)
+      (let* ((MATCH nil)
+             (SCOPE 'file)
+             (SKIP nil)
+             (sec-name (or sec-name "README")))
+        (org-map-entries
+         (lambda ()
+           (let ((name (nth 4 (org-heading-components))))
+             (if (string= name sec-name)
+                 (save-restriction
+                   (org-mark-subtree)
+                   (forward-line)
+                   (delete-region (region-beginning) (region-end))
+                   (insert (get-comment))
+                   ))
+             )) MATCH SCOPE SKIP)
+        (message "====> Updated the '%s' section!" sec-name)
+        )
+      )
+    )
+
+  ;; ------------------------------------------------------------------
+  ; Define a local org-capture template, to quickly modify & update the
+  ; "Usage" section.
+  (setq-local
+   org-capture-templates
+   (add-to-list 'org-capture-templates
+                '("a" "ox-conf.el" plain
+                  (file+regexp
+                   "~/.emacs.d/myscripts-dev/ox-conf/ox-conf.el"
+                   ";;; Commentary:"
+                   )
+                  "%?"
+                  :unnarrowed t
+                  :after-finalize (ox-conf-capture--hook)
+                  )
+                )
+   )
+
+  (ox-conf-capture--hook)
+#+end_src
+
+* README
+This is an org export backend that supports Confluence wiki storage format...
+
+Prerequisites:
+  - Confluene page:
+    - Create one conf page on your Confluence cloud side. (Currently
+      ox-conf.el doesn't support creating the page from scratch,
+      instead it updates an existing page when exporting.)
+  - Org file:
+    - Add `#+CONF_ID' and `#+CONF_SPACE' at the top of the .org file
+      you want to export.
+  - Emacs init:
+    - Install `ox-conf.el'...
+    - Specify `org-conf-url' according to your host URL in your init file (e.g. init.el).
+    - Specify `org-conf-jira-chart-server' according to your case.
+      - Ref: https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html
+    - Specify `org-conf-jria-chart-server-id' according to your case.
+
+Exporting:
+  - Wake up org-export dispatch.
+  - Press `f f' for exporting to the CONF_PAGE you provided.
+
+Options:
+  - `f b': "To buffer" org-conf-export-to-buffer
+  - `f p': "Page info" org-conf-export-page-info
+  - `f i': "Image info" org-conf-export-img-info
+  - `f f': "To Confluence" org-conf-export-to-conf
+  - `f w': "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
+  - `f r': "Forget the wrong password" org-conf-forget-password
+
+Response:
+  - Once exported successfully, yout will get `PUT SUCCEED' response.
+
+Note:
+  Most of the codes in this file are adapted from ox-html.el.
+  Part of the codes are inspired by org-jira.el.
+* Example
+Given this file: =tmp.org=.
+#+begin_src org
+  ,#+TITLE: tmp
+  ,#+AUTHOR: John Doe
+  ,#+CONF_SPACE: xxx
+  ,#+CONF_PAGE: xxx
+  ,#+CONF_ID: xxx
+  ,#+OPTIONS: ^:{}
+  ,* Heading
+  Hello, world!
+#+end_src
+
+Run ~M-x org-export-dispatch f f~.
+
+* References
+- Confluence
+  - [[https://confluence.atlassian.com/doc/confluence-storage-format-790796544.html][Storage Format]]
+  - [[https://confluence.atlassian.com/display/CONF54/Confluence+Storage+Format][Confluence Storage Format - Confluence 5.4 - Atlassian Documentation]]
+  - Macro
+    - [[https://confluence.atlassian.com/conf59/macros-792499066.html][Macros | Confluence Data Center 5.9 | Atlassian Documentation]]
+  - Chart
+    - [[https://confluence.atlassian.com/display/CONF54/Confluence+Storage+Format+Examples+for+Chart+Macro][Confluence Storage Format Examples for Chart Macro - Confluence 5.4 - Atlassian Documentation]]
+  - Change history
+    - [[https://confluence.atlassian.com/conf59/change-history-macro-792499072.html][Change-History Macro | Confluence Data Center 5.9 | Atlassian Documentation]]
+- Jira
+  - [[https://docs.atlassian.com/software/jira/docs/api/REST/7.6.1/#api/2/issue-createIssues][JIRA 7.6.1]]
+  - [[https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-users/#api-group-users][The Jira Cloud platform REST API]]
+  - [[https://developer.atlassian.com/server/jira-servicedesk/rest/v1000/api-group-user/#api-group-user][The Jira Service Management REST API]]
+  - [[https://confluence.atlassian.com/conf59/jira-issues-macro-792499129.html][JIRA Issues Macro | Confluence Data Center 5.9 | Atlassian Documentation]]
+  - Jira chart
+    - [[https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html][JIRA Chart Macro | Confluence Data Center 5.9 | Atlassian Documentation]]
+  - JQL
+    - [[https://support.atlassian.com/jira-service-management-cloud/docs/jql-fields/][JQL fields | Jira Service Management Cloud | Atlassian Support]]
+    - [[https://support.atlassian.com/jira-service-management-cloud/docs/jql-operators/][JQL operators | Jira Service Management Cloud | Atlassian Support]]
+
+
