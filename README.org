@@ -6,7 +6,7 @@
 #+export_exclude_tags: noexport
 #+property: HEADER-ARGS+ :eval no-export
 #+options: ^:{}
-Last updated Time-stamp: <2025-01-21 14:56:10>
+Last updated Time-stamp: <2025-01-21 16:43:02>
 # ===================================================================================
 # Hints:
 #   - Run M-x org-capture a to update the commentary in ox-conf.el.
@@ -44,7 +44,9 @@ Last updated Time-stamp: <2025-01-21 14:56:10>
       (let* ((MATCH nil)
              (SCOPE 'file)
              (SKIP nil)
-             (sec-name (or sec-name "README")))
+             (sec-name (or sec-name "README"))
+             (new-content (get-comment))
+             (_msg nil))
         (org-map-entries
          (lambda ()
            (let ((name (nth 4 (org-heading-components))))
@@ -52,11 +54,17 @@ Last updated Time-stamp: <2025-01-21 14:56:10>
                  (save-restriction
                    (org-mark-subtree)
                    (forward-line)
-                   (delete-region (region-beginning) (region-end))
-                   (insert (get-comment))
+                   (if (string= (buffer-substring-no-properties (region-beginning) (region-end)) new-content)
+                       (setq _msg "====> No new contents.")
+                     (progn
+                       (delete-region (region-beginning) (region-end))
+                       (insert (get-comment))
+                       (setq _msg (format "====> Updated the '%s' section!" sec-name))
+                       )
+                     )
                    ))
              )) MATCH SCOPE SKIP)
-        (message "====> Updated the '%s' section!" sec-name)
+        (message _msg)
         )
       )
     )
