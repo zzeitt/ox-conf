@@ -128,7 +128,7 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
 (define-skeleton ske-conf
   "Quick insert the required options."
   nil
-  "#+CONF_SPACE: " (skeleton-read "Your conf space: ") \n
+  "#+CONF_SPACE: " (skeleton-read "Your conf space: " org-conf-default-space) \n
   "#+CONF_PAGE: " (setq v1 (skeleton-read "Your conf page url: ")) \n
   "#+CONF_ID: " (org-conf--return-id-from-url v1) \n
   )
