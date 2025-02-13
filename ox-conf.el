@@ -57,6 +57,11 @@
 ;; Note:
 ;;   Most of the codes in this file are adapted from =ox-html.el=.
 ;;   Part of the codes are inspired by =org-jira.el=.
+;;
+;; Change Log:
+;;   - 2025-01-21: Initial commit.
+;;   - 2025-02-13: Fix markup not exported as expected.
+
 
 ;;; Code:
 
@@ -839,7 +844,7 @@ information."
   :options-alist
   '(
     (:with-toc nil)
-    (:html-text-markup-alist nil org-conf-text-markup-alist nil)
+    (:html-text-markup-alist nil nil org-conf-text-markup-alist nil)
     (:conf-id "CONF_ID" nil nil t)
     (:conf-space "CONF_SPACE" nil org-conf-default-space t)
     )

@@ -6,7 +6,7 @@
 #+export_exclude_tags: noexport
 #+property: HEADER-ARGS+ :eval no-export
 #+options: ^:{}
-Last updated Time-stamp: <2025-01-21 16:43:02>
+Last updated Time-stamp: <2025-02-13 18:25:45>
 # ===================================================================================
 # Hints:
 #   - Run M-x org-capture a to update the commentary in ox-conf.el.
@@ -126,6 +126,11 @@ Response:
 Note:
   Most of the codes in this file are adapted from =ox-html.el=.
   Part of the codes are inspired by =org-jira.el=.
+
+Change Log:
+  - 2025-01-21: Initial commit.
+  - 2025-02-13: Fix markup not exported as expected.
+
 * Example
 Given this file: =tmp.org=.
 #+begin_src org
@@ -161,5 +166,9 @@ Run ~M-x org-export-dispatch f f~.
   - JQL
     - [[https://support.atlassian.com/jira-service-management-cloud/docs/jql-fields/][JQL fields | Jira Service Management Cloud | Atlassian Support]]
     - [[https://support.atlassian.com/jira-service-management-cloud/docs/jql-operators/][JQL operators | Jira Service Management Cloud | Atlassian Support]]
+- OrgMode
+  - [[https://orgmode.org/worg/dev/org-export-reference.html][Org Export Reference Documentation]]
+  - [[https://www.gnu.org/software/emacs/manual/html_node/org/Advanced-Export-Configuration.html][Advanced Export Configuration (The Org Manual)]]
+      
 
 
