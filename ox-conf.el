@@ -61,6 +61,7 @@
 ;; Change Log:
 ;;   - 2025-01-21: Initial commit.
 ;;   - 2025-02-13: Fix markup not exported as expected.
+;;   - 2025-04-01: Ask user when attachment exists on server.
 
 
 ;;; Code:
@@ -151,6 +152,22 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
 </ac:structured-macro>\n"
    contents))
 
+(defun org-conf--tags (tags info)
+  "Format TAGS into HTML.
+INFO is a plist containing export options."
+  (when tags
+    (mapconcat
+     (lambda (tag)
+       (format
+"<ac:structured-macro ac:name=\"status\">
+  <ac:parameter ac:name=\"colour\">Grey</ac:parameter>
+  <ac:parameter ac:name=\"title\">%s</ac:parameter>
+  <ac:parameter ac:name=\"subtle\">true</ac:parameter>
+</ac:structured-macro>
+"
+	tag))
+     )))
+
 (defun org-conf-headline (headline contents info)
   "Transcode a HEADLINE element from Org to HTML.
     CONTENTS holds the contents of the headline.  INFO is a plist
@@ -158,11 +175,15 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
   (let* ((level (+ (org-export-get-relative-level headline info)))
          (text (org-export-data (org-element-property :title headline) info))
          (id (org-html--reference headline info))
+         (tags (and (plist-get info :with-tags)
+                    (org-export-get-tags headline info)))
+         (tags (org-conf--tags tags info))
          (contents (or contents "")))
     (format "%s%s\n"
-            (format "\n<h%d>%s</h%d>\n"
+            (format "\n<h%d>%s%s</h%d>\n"
                     level
                     text
+                    tags
                     level)
             contents)))
 
@@ -512,8 +533,7 @@ contextual information."
            (org-export-inline-image-p
             link (plist-get info :html-inline-image-rules)))
       (if (plist-get info :org-conf-do-post)
-          (org-conf-img-link-upload
-           (plist-get info :org-conf-user)
+          (org-conf--upload-img
            (plist-get info :org-conf-id)
            path)
           ;; (message "%s" info)
@@ -578,7 +598,7 @@ information."
 ;;; ======================================================================
 ;;;                          Request Methods                             
 ;;; ======================================================================
-(defun org-conf-rest-get-page-json (user conf-id)
+(defun org-conf-rest-get-page-json (conf-id)
   "Retrieve a Confluence page's status information using GET method."
   (request-response-data
     (request
@@ -599,7 +619,7 @@ information."
                             (message "Got error: %S" error-thrown)))
       )))
 
-(defun org-conf-rest-put (user conf-id title conf-space body version ver-msg)
+(defun org-conf-rest-put (conf-id title conf-space body version ver-msg)
   (let* ((request-log-level org-conf-log-level)
          (request-message-level org-conf-log-level))
     (request-response-data
@@ -626,7 +646,8 @@ information."
     )
   )
 
-(defun org-conf-rest-get-attach-json (user conf-id)
+(defun org-conf-rest-get-attach-json (conf-id)
+  "Get attachements from CONF-ID page through rest api."
   (request-response-data
     (request
       (org-conf--return-api-url (format "/rest/api/content/%s/child/attachment" conf-id))
@@ -644,23 +665,31 @@ information."
       :timeout 2
       :success (cl-function
                 (lambda (&key data &allow-other-keys)
-                  (when data (message "Got Attachments!"))))
+                  (when data (message "Got Attachment(s)!"))))
       :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
                             (message "Got error: %S" error-thrown)))
       )))
 
-(defun org-conf-rest-post-file (user conf-id filepath &optional attach-id)
+(defun org-conf-rest-post-file (conf-id filepath &optional attach-id)
   (let* ((request-log-level org-conf-log-level)
-         (request-message-level org-conf-log-level))
+         (request-message-level org-conf-log-level)
+         (request-url))
+    (if attach-id
+        (progn
+          (setq request-url
+                (org-conf--return-api-url
+                 (format "/rest/api/content/%s/child/attachment/%s/data" conf-id attach-id))))
+      (progn
+        (setq request-url
+              (org-conf--return-api-url
+               (format "/rest/api/content/%s/child/attachment" conf-id)))))
     (request-response-data
      (request
-       (if attach-id
-           (org-conf--return-api-url (format "/rest/api/content/%s/child/attachment/%s/data" conf-id attach-id))
-         (org-conf--return-api-url (format "/rest/api/content/%s/child/attachment" conf-id))
-         )
+       request-url
        :auth "basic"
        :type "POST"
        :files `(("file" . ,(expand-file-name filepath)))
+       :user-defined-form '(("minorEdit" . "\"ture\""))
        :headers '(("X-Atlassian-Token" . "no-check"))
        :success (cl-function
                  (lambda (&key data &allow-other-keys)
@@ -671,6 +700,22 @@ information."
     )
   )
 
+(defun org-conf--upload-img (conf-id link)
+  "Given image file or attachment's path LINK, upload it to conf page with CONF-ID.
+@done: Ask for replace or not if image exists."
+  (let* ((attach-json (org-conf-rest-get-attach-json conf-id))
+         (filename (file-name-nondirectory link))
+         (attach-id (org-conf--parse-attach-json
+                     attach-json filename)))
+    (if attach-id
+        ;; Existed attachment will be asked first
+        (if (y-or-n-p (format "Attachment '%s' already exists, replace?" filename))
+            (org-conf-rest-post-file conf-id link attach-id))
+      ;; New attatchment will be uploaded
+      (org-conf-rest-post-file conf-id link attach-id)
+      )
+    ))
+
 
 ;;; ======================================================================
 ;;;                          Json Parsers
@@ -680,7 +725,10 @@ information."
                    (cdr (assoc 'title page-json))
                    (cdr (assoc 'number (assoc 'version page-json))))))
 
-(defun org-conf-attachs-json-parser (attachs-json &optional filename)
+(defun org-conf--parse-attach-json (attachs-json &optional filename)
+  "Pasrse the attachments' json into string info.
+@param ATTACHS-JSON: attachments's json
+@param FILENAME:     specify an attachment's filename"
   ;; `append will convert vector to list
   (let ((attachs (append (plist-get attachs-json :results) nil))
         (cur-title nil)
@@ -693,13 +741,6 @@ information."
             (if (string= cur-title filename) (throw 'get-attach-id cur-id))
           ;; No filename provided, just print attachments.
           (message "===> Image info: title is %s, ID is %s." cur-title cur-id))))))
-
-(defun org-conf-img-link-upload (user conf-id link)
-  (let* ((attach-json (org-conf-rest-get-attach-json user conf-id))
-         (attach-id (org-conf-attachs-json-parser
-                     attach-json (file-name-nondirectory link))))
-    (org-conf-rest-post-file user conf-id link attach-id)))
-
 
 ;;; ======================================================================
 ;;;                          Export Functions                             
@@ -715,13 +756,13 @@ information."
         (res nil))
     (if conf-id
         (progn
-          (setq res (org-conf-rest-get-page-json user conf-id))
+          (setq res (org-conf-rest-get-page-json conf-id))
           (org-conf-page-json-parser res))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-img-info
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export message about current article's status."
+  "Export message about current article's image attachements info."
   (interactive)
   ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
   ;; So put it above exporting.
@@ -730,8 +771,8 @@ information."
         (res nil))
     (if conf-id
         (progn
-          (setq res (org-conf-rest-get-attach-json user conf-id))
-          (org-conf-attachs-json-parser res))
+          (setq res (org-conf-rest-get-attach-json conf-id))
+          (org-conf--parse-attach-json res))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-to-conf
@@ -752,7 +793,7 @@ information."
     (if conf-id
         (progn
           ;; Update page version number.
-          (setq res (org-conf-rest-get-page-json user conf-id))
+          (setq res (org-conf-rest-get-page-json conf-id))
           (setq version (1+ (cdr (assoc 'number (assoc 'version res)))))
           ;; Pass export parameters through communication channel.
           (setq org-conf-plist
@@ -765,7 +806,7 @@ information."
                         'org-conf-html subtreep visible-only body-only org-conf-plist))
           ;; Update the page!
           (setq ver-msg (read-string "Version message: "))
-          (org-conf-rest-put user conf-id title conf-space output version ver-msg))
+          (org-conf-rest-put conf-id title conf-space output version ver-msg))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-to-conf-without-post
@@ -786,7 +827,7 @@ information."
     (if conf-id
         (progn
           ;; Update page version number.
-          (setq res (org-conf-rest-get-page-json user conf-id))
+          (setq res (org-conf-rest-get-page-json conf-id))
           (setq version (1+ (cdr (assoc 'number (assoc 'version res)))))
           ;; Pass export parameters through communication channel.
           (setq org-conf-plist
@@ -799,7 +840,7 @@ information."
                         'org-conf-html subtreep visible-only body-only org-conf-plist))
           ;; Update the page!
           (setq ver-msg (read-string "Version message: "))
-          (org-conf-rest-put user conf-id title conf-space output version ver-msg))
+          (org-conf-rest-put conf-id title conf-space output version ver-msg))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-to-buffer
@@ -844,6 +885,7 @@ information."
   :options-alist
   '(
     (:with-toc nil)
+    (:with-tags nil)
     (:html-text-markup-alist nil nil org-conf-text-markup-alist nil)
     (:conf-id "CONF_ID" nil nil t)
     (:conf-space "CONF_SPACE" nil org-conf-default-space t)
