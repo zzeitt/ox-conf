@@ -62,6 +62,8 @@
 ;;   - 2025-01-21: Initial commit.
 ;;   - 2025-02-13: Fix markup not exported as expected.
 ;;   - 2025-04-01: Ask user when attachment exists on server.
+;;   - 2025-04-10: Fixed tags/toc format, added org-conf-inner-template.
+;;                 Now can control tags/toc through #+OPTIONS: toc/tags.
 
 
 ;;; Code:
@@ -144,29 +146,55 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
 ;;; ======================================================================
 ;;;                            Templates                             
 ;;; ======================================================================
-(defun org-conf-template (contents info)
+(defun org-conf-template (contents _info)
+  "Return complete document string after CONF conversion.
+CONTENTS is the transcoded contents string.  INFO is a plist used
+as a communication channel."
+  contents)
+
+(defun org-conf-inner-template (contents info)
+  "Return body of document string after CONF conversion.
+CONTENTS is the transcoded contents string.  INFO is a plist
+holding export options."
   (concat
-"<h1>目录</h1>
+   ;; Table of contents.
+   (let ((depth (plist-get info :with-toc)))
+     (when depth (org-conf-toc depth info)))
+   ;; Document contents.
+   contents
+   ))
+
+(defun org-conf-toc (depth info)
+  "Generate TOC."
+  (format
+   "<h1>目录</h1>
 <ac:structured-macro ac:name=\"toc\">
   <ac:parameter ac:name=\"outline\">true</ac:parameter>
+  <ac:parameter ac:name=\"maxLevel\">%s</ac:parameter>
 </ac:structured-macro>\n"
-   contents))
+   (if (eq depth t)
+       7
+     depth)
+   )
+  )
 
-(defun org-conf--tags (tags info)
-  "Format TAGS into HTML.
-INFO is a plist containing export options."
-  (when tags
-    (mapconcat
-     (lambda (tag)
-       (format
+(defun org-conf--tags (tags)
+  "Format TAGS into HTML."
+  (if tags
+    (format "\n<span class=\"tag\">%s</span>\n"
+            (mapconcat
+             (lambda (tag)
+               (format
 "<ac:structured-macro ac:name=\"status\">
   <ac:parameter ac:name=\"colour\">Grey</ac:parameter>
   <ac:parameter ac:name=\"title\">%s</ac:parameter>
   <ac:parameter ac:name=\"subtle\">true</ac:parameter>
 </ac:structured-macro>
 "
-	tag))
-     )))
+	        tag))
+             tags "&#xa0;"))
+    ;; No tags is empty
+    ""))
 
 (defun org-conf-headline (headline contents info)
   "Transcode a HEADLINE element from Org to HTML.
@@ -175,9 +203,9 @@ INFO is a plist containing export options."
   (let* ((level (+ (org-export-get-relative-level headline info)))
          (text (org-export-data (org-element-property :title headline) info))
          (id (org-html--reference headline info))
-         (tags (and (plist-get info :with-tags)
-                    (org-export-get-tags headline info)))
-         (tags (org-conf--tags tags info))
+         (tags (if (plist-get info :with-tags)
+                   (org-conf--tags (org-export-get-tags headline info))
+                 ""))
          (contents (or contents "")))
     (format "%s%s\n"
             (format "\n<h%d>%s%s</h%d>\n"
@@ -867,6 +895,7 @@ information."
   :translate-alist
   '(
     (template . org-conf-template)
+    (inner-template . org-conf-inner-template)
     (headline . org-conf-headline)
     (section . org-conf-section)
     (center-block . org-conf-center-block)
@@ -884,8 +913,6 @@ information."
     )
   :options-alist
   '(
-    (:with-toc nil)
-    (:with-tags nil)
     (:html-text-markup-alist nil nil org-conf-text-markup-alist nil)
     (:conf-id "CONF_ID" nil nil t)
     (:conf-space "CONF_SPACE" nil org-conf-default-space t)

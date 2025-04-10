@@ -6,7 +6,7 @@
 #+export_exclude_tags: noexport
 #+property: HEADER-ARGS+ :eval no-export
 #+options: ^:{}
-Last updated Time-stamp: <2025-04-01 20:39:51>
+Last updated Time-stamp: <2025-04-10 15:00:35>
 # ===================================================================================
 # Hints:
 #   - Run M-x org-capture a to update the commentary in ox-conf.el.
@@ -131,6 +131,8 @@ Change Log:
   - 2025-01-21: Initial commit.
   - 2025-02-13: Fix markup not exported as expected.
   - 2025-04-01: Ask user when attachment exists on server.
+  - 2025-04-10: Fixed tags/toc format, added org-conf-inner-template.
+                Now can control tags/toc through #+OPTIONS: toc/tags.
 
 * Example
 Given this file: =tmp.org=.
