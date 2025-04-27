@@ -63,7 +63,10 @@
 ;;   - 2025-02-13: Fix markup not exported as expected.
 ;;   - 2025-04-01: Ask user when attachment exists on server.
 ;;   - 2025-04-10: Fixed tags/toc format, added org-conf-inner-template.
-;;                 Now can control tags/toc through #+OPTIONS: toc/tags.
+;;                 Now can control tags/toc through ~#+OPTIONS: toc/tags~.
+;;   - 2025-04-27: Introduced numbered headings, can be set through
+;;                 ~#+OPTIONS: num:t~.
+;;                 Excluded ~org-conf-toc-headline~.
 
 
 ;;; Code:
@@ -93,6 +96,12 @@
 (defcustom org-conf-default-space
   ""
   "Your Confluence space."
+  :type 'string
+  :group 'org-export-conf)
+
+(defcustom org-conf-toc-headline
+  "目录"
+  "The headline name of TOC."
   :type 'string
   :group 'org-export-conf)
 
@@ -167,14 +176,17 @@ holding export options."
 (defun org-conf-toc (depth info)
   "Generate TOC."
   (format
-   "<h1>目录</h1>
+   "<h1>%s</h1>
 <ac:structured-macro ac:name=\"toc\">
   <ac:parameter ac:name=\"outline\">true</ac:parameter>
   <ac:parameter ac:name=\"maxLevel\">%s</ac:parameter>
-</ac:structured-macro>\n"
+  <ac:parameter ac:name=\"exclude\">%s</ac:parameter>
+</ac:structured-macro>\n\n"
+   org-conf-toc-headline
    (if (eq depth t)
        7
      depth)
+   org-conf-toc-headline
    )
   )
 
@@ -202,18 +214,33 @@ holding export options."
     holding contextual information."
   (let* ((level (+ (org-export-get-relative-level headline info)))
          (text (org-export-data (org-element-property :title headline) info))
+         (numbers (org-export-get-headline-number headline info))
          (id (org-html--reference headline info))
          (tags (if (plist-get info :with-tags)
                    (org-conf--tags (org-export-get-tags headline info))
                  ""))
-         (contents (or contents "")))
+         (_head (format "\n<h%d>%s%s</h%d>\n"
+                  level
+                  text
+                  tags
+                  level))
+         (sec-num (plist-get info :section-numbers))
+         (_head (if sec-num
+                    (format
+"<ac:structured-macro ac:name=\"numberedheadings\">
+  <ac:parameter ac:name=\"start-numbering-with\">%s</ac:parameter>
+  <ac:rich-text-body>%s</ac:rich-text-body>
+</ac:structured-macro>
+"
+                     (mapconcat #'number-to-string numbers ",")
+                     _head)
+                  ))
+         (contents (or contents ""))
+         )
     (format "%s%s\n"
-            (format "\n<h%d>%s%s</h%d>\n"
-                    level
-                    text
-                    tags
-                    level)
-            contents)))
+            _head 
+            contents)
+    ))
 
 (defun org-conf-section (section contents info)
   "transcode a section element from org to html.
