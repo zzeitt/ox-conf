@@ -67,6 +67,9 @@
 ;;   - 2025-04-27: Introduced numbered headings, can be set through
 ;;                 ~#+OPTIONS: num:t~.
 ;;                 Excluded ~org-conf-toc-headline~.
+;;   - 2025-05-12: Fixed wrongly parse latex-fragment element to 'mathblock'.
+;;                 Fixed '<', etc char escaping issue in XML exporting.
+;;                 Special block fall through to 'info-block'.
 
 
 ;;; Code:
@@ -180,7 +183,7 @@ holding export options."
 <ac:structured-macro ac:name=\"toc\">
   <ac:parameter ac:name=\"outline\">true</ac:parameter>
   <ac:parameter ac:name=\"maxLevel\">%s</ac:parameter>
-  <ac:parameter ac:name=\"exclude\">%s</ac:parameter>
+  <ac:parameter ac:name=\"exclude\">^%s$</ac:parameter>
 </ac:structured-macro>\n\n"
    org-conf-toc-headline
    (if (eq depth t)
@@ -259,28 +262,24 @@ holding export options."
   as a string, the back-end, as a symbol, and the communication
   channel, as a plist.  it must return a string or nil."
   (format
-"<ac:structured-macro ac:name=\"mathblock\">
-  <ac:parameter ac:name=\"alignment\">left</ac:parameter>
-  <ac:plain-text-body>
-    <![CDATA[
-%s
-    ]]>
-  </ac:plain-text-body>
-</ac:structured-macro>"
+"\n<ac:structured-macro ac:name=\"mathinline\">
+  <ac:parameter ac:name=\"body\">%s</ac:parameter>
+</ac:structured-macro>\n"
   ;; Remove guiding '\(' and trailing '\)'.
-  (replace-regexp-in-string "\\\\(\\|\\\\)" "" data)))
+  (replace-regexp-in-string "\\\\(\\|\\\\)" "" (org-html-encode-plain-text data))
+))
 
 (defun org-conf-latex-environment-filter (data backend info)
   "Function applied to a transcoded latex-environment."
   (format
-"<ac:structured-macro ac:name=\"mathblock\">
+"\n<ac:structured-macro ac:name=\"mathblock\">
   <ac:parameter ac:name=\"alignment\">center</ac:parameter>
   <ac:plain-text-body>
     <![CDATA[
 %s
     ]]>
   </ac:plain-text-body>
-</ac:structured-macro>"
+</ac:structured-macro>\n"
   data))
 
 (defun org-conf-export-block-filter (data backend info)
@@ -304,8 +303,9 @@ holding contextual information."
 CONTENTS is nil.  INFO is a plist holding contextual
 information."
   (let* ((title (car (org-export-get-caption example-block)))
-         (code-info (org-export-unravel-code example-block))
-         (text (car code-info)))
+         ;; (code-info (org-export-unravel-code example-block))
+         ;; (text (car code-info))
+         )
     (if (not title) (setq title "[Example]"))
     (format
 "<ac:structured-macro ac:name=\"panel\">
@@ -315,7 +315,7 @@ information."
   <ac:rich-text-body>
     <pre>%s</pre>
   </ac:rich-text-body>
-</ac:structured-macro>" title text)
+</ac:structured-macro>" title _contents)
     ))
 
 ;; Only by setting org-babel-exp-code-template will the
@@ -331,6 +331,30 @@ information."
 :ystat-type %ystat-type \
 :collapse %collapse\n%body\n\
 #+end_src")
+
+;; Plain text
+(defun org-conf-plain-text (text info)
+  "Transcode a TEXT string from Org to HTML.
+TEXT is the string to transcode.  INFO is a plist holding
+contextual information."
+  (let ((output text))
+    ;; Protect following characters: <, >, &.
+    (setq output (org-html-encode-plain-text output))
+    ;; Handle smart quotes.  Be sure to provide original string since
+    ;; OUTPUT may have been modified.
+    (when (plist-get info :with-smart-quotes)
+      (setq output (org-export-activate-smart-quotes output :html info text)))
+    ;; Handle special strings.
+    (when (plist-get info :with-special-strings)
+      (setq output (org-html-convert-special-strings output)))
+    ;; Handle break preservation if required.
+    (when (plist-get info :preserve-breaks)
+      (setq output
+	    (replace-regexp-in-string
+	     "\\(\\\\\\\\\\)?[ \t]*\n"
+	     (concat (org-html-close-tag "br" nil info) "\n") output)))
+    ;; Return value.
+    output))
 
 (defun org-conf-special-block (special-block contents info)
   "Transcode a SPECIAL-BLOCK element from Org to HTML.
@@ -358,16 +382,6 @@ holding contextual information."
       (format
 "<ac:structured-macro ac:name=\"note\">
   <ac:parameter ac:name=\"icon\">true</ac:parameter>
-  <ac:parameter ac:name=\"title\">%s</ac:parameter>
-  <ac:rich-text-body>
-%s
-  </ac:rich-text-body>
-</ac:structured-macro>" title contents))
-     ;; Info block
-     ((string= "info" block-type)
-      (if (not title) (setq title "[Info]"))
-      (format
-"<ac:structured-macro ac:name=\"info\">
   <ac:parameter ac:name=\"title\">%s</ac:parameter>
   <ac:rich-text-body>
 %s
@@ -401,6 +415,16 @@ holding contextual information."
 "<ac:structured-macro ac:name=\"change-history\">
   <ac:parameter ac:name=\"limit\">%s</ac:parameter>
 </ac:structured-macro>" limit)))
+     ;; Info block or Others
+     (block-type
+      (if (not title) (setq title "[Info]"))
+      (format
+"<ac:structured-macro ac:name=\"info\">
+  <ac:parameter ac:name=\"title\">%s</ac:parameter>
+  <ac:rich-text-body>
+%s
+  </ac:rich-text-body>
+</ac:structured-macro>" title contents))
      )))
 
 (defun org-conf-src-block (src-block _contents info)
@@ -931,6 +955,7 @@ information."
     (special-block . org-conf-special-block)
     (link . org-conf-link)
     (target . org-conf-target)
+    (plain-text . org-html-plain-text)
     )
   :filters-alist
   '(
