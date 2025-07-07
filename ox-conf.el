@@ -70,6 +70,8 @@
 ;;   - 2025-05-12: Fixed wrongly parse latex-fragment element to 'mathblock'.
 ;;                 Fixed '<', etc char escaping issue in XML exporting.
 ;;                 Special block fall through to 'info-block'.
+;;   - 2025-07-04: Added 'section' block and 'column' block.
+;;   - 2025-07-07: Exported svg image as embedded html with <iframe>.
 
 
 ;;; Code:
@@ -356,6 +358,16 @@ contextual information."
     ;; Return value.
     output))
 
+;; Special blocks
+(add-to-list 'org-structure-template-alist '("w" . "warning"))
+(add-to-list 'org-structure-template-alist '("n" . "note"))
+(add-to-list 'org-structure-template-alist '("t" . "tip"))
+(add-to-list 'org-structure-template-alist '("p" . "expand"))
+(add-to-list 'org-structure-template-alist '("y" . "history"))
+(add-to-list 'org-structure-template-alist '("i" . "info"))
+(add-to-list 'org-structure-template-alist '("1" . "section"))
+(add-to-list 'org-structure-template-alist '("2" . "column"))
+
 (defun org-conf-special-block (special-block contents info)
   "Transcode a SPECIAL-BLOCK element from Org to HTML.
 CONTENTS holds the contents of the block.  INFO is a plist
@@ -415,8 +427,8 @@ holding contextual information."
 "<ac:structured-macro ac:name=\"change-history\">
   <ac:parameter ac:name=\"limit\">%s</ac:parameter>
 </ac:structured-macro>" limit)))
-     ;; Info block or Others
-     (block-type
+     ;; Info block
+     ((string= "info" block-type)
       (if (not title) (setq title "[Info]"))
       (format
 "<ac:structured-macro ac:name=\"info\">
@@ -425,6 +437,46 @@ holding contextual information."
 %s
   </ac:rich-text-body>
 </ac:structured-macro>" title contents))
+     ;; Section
+     ((string= "section" block-type)
+      (let* ((border (cdr (assoc :border pars)))
+             )
+        (if (not border)
+            ;; border argumet is nil, default to "true"
+            (setq border-conf "true")
+          ;; User specified border argument
+          (cond ((string= border "no")
+                 (setq border-conf "false"))
+                ((string= border "yes")
+                 (setq border-conf "true"))
+                (t
+                 (error "You need to specify :border as 'yes' or 'no'!"))
+                )
+          )
+        (format
+"<ac:structured-macro ac:name=\"section\">
+  <ac:parameter ac:name=\"border\">%s</ac:parameter>
+  <ac:rich-text-body>
+%s
+  </ac:rich-text-body>
+</ac:structured-macro>" border-conf contents)))
+     ;; Column
+     ((string= "column" block-type)
+      (let* ((width (cdr (assoc :width pars)))
+             (width-conf (if width
+                             (format "  <ac:parameter ac:name=\"width\">%s</ac:parameter>" width)
+                           ""
+                           ))
+             )
+        (format
+"<ac:structured-macro ac:name=\"column\">
+%s
+  <ac:rich-text-body>
+%s
+  </ac:rich-text-body>
+</ac:structured-macro>" width-conf contents)))
+     ;; Others
+     (block-type "") ;; Just ignored.
      )))
 
 (defun org-conf-src-block (src-block _contents info)
@@ -561,6 +613,37 @@ contextual information."
 </ac:structured-macro>" lang num-start collapse title env-comment code))
      )))
 
+(defun org-conf--embed-svg (source attributes info)
+  "Embed SVG as Base64 iframe with proper closing tag.
+Givne filename as SOURCE, org-inlined ATTRIBUTES and export INFO."
+  (if (string= "svg" (file-name-extension source))
+      ;; SVG handling (always Base64 iframe)
+      (with-temp-buffer
+        (insert-file-contents source)
+        (let* ((base64-content (base64-encode-string (buffer-string)))
+               (width nil)
+               (height nil)
+               (aspect-ratio (when (string-match "viewBox=\"[^\"]*\"" (buffer-string))
+                               (let ((viewbox (match-string 0 (buffer-string))))
+                                 (when (string-match "\\bviewBox=\"\\([0-9.]+\\) \\([0-9.]+\\) \\([0-9.]+\\) \\([0-9.]+\\)\"" viewbox)
+                                   (setq width (match-string 3 viewbox))
+                                   (setq height (match-string 4 viewbox))
+                                   (format "%s/%s" width height)))))
+               (iframe-attrs (org-html--make-attribute-string
+                              (org-combine-plists
+                               attributes
+                               `(
+                                 :src ,(concat "data:image/svg+xml;base64," base64-content)
+                                 :title ,(org-html--reference source info)
+                                 :style ,(format "border:none; width:%s; height:auto; aspect-ratio:%s"
+                                                 width
+                                                 (or aspect-ratio 16/9)
+                                                 ))))))
+          (concat "<iframe " iframe-attrs "></iframe>")))
+
+    ;; Non-SVG case - call original function
+    (error "Not a svg file!")))
+
 (defun org-conf-link (link desc info)
   "Link parser"
   (let* ((path (org-element-property :path link))
@@ -607,6 +690,16 @@ contextual information."
           (_
            (let* ((ref (org-html--reference destination info)))
              (format "<a href=\"#%s-%s\">%s</a>" file-title ref desc))))))
+     ;; SVG file.
+     ((and (org-export-inline-image-p link (plist-get info :html-inline-image-rules))
+           (string= "svg" (file-name-extension path)))
+      (format
+"<ac:structured-macro ac:name=\"html\">
+  <ac:plain-text-body>
+    <![CDATA[%s]]>
+  </ac:plain-text-body>
+</ac:structured-macro>" (org-conf--embed-svg path attributes-plist info))
+      )
      ;; Image file.
      ((and (plist-get info :html-inline-images)
            (org-export-inline-image-p
