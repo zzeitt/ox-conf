@@ -72,6 +72,8 @@
 ;;                 Special block fall through to 'info-block'.
 ;;   - 2025-07-04: Added 'section' block and 'column' block.
 ;;   - 2025-07-07: Exported svg image as embedded html with <iframe>.
+;;   - 2025-11-17: Deprecated 'example-block'.
+;;   - 2025-11-27: Added 'footnote' support.
 
 
 ;;; Code:
@@ -176,6 +178,8 @@ holding export options."
      (when depth (org-conf-toc depth info)))
    ;; Document contents.
    contents
+   ;; Footnotes section.
+   (org-html-footnote-section info)
    ))
 
 (defun org-conf-toc (depth info)
@@ -203,14 +207,22 @@ holding export options."
              (lambda (tag)
                (format
 "<ac:structured-macro ac:name=\"status\">
-  <ac:parameter ac:name=\"colour\">Grey</ac:parameter>
+  <ac:parameter ac:name=\"colour\">%s</ac:parameter>
   <ac:parameter ac:name=\"title\">%s</ac:parameter>
   <ac:parameter ac:name=\"subtle\">true</ac:parameter>
 </ac:structured-macro>
 "
-	        tag))
+                ;; color
+                (cond ((string= "新增" tag) "Green")
+                      ((string= "修改" tag) "Yello")
+                      ((string= "删除" tag) "Red")
+                      ((string= "复制" tag) "Blue")
+                      (t "Grey")
+                       ) ;; color
+                tag ;; tag
+                ))
              tags "&#xa0;"))
-    ;; No tags is empty
+    ;; No tag, return empty.
     ""))
 
 (defun org-conf-headline (headline contents info)
@@ -305,19 +317,23 @@ holding contextual information."
 CONTENTS is nil.  INFO is a plist holding contextual
 information."
   (let* ((title (car (org-export-get-caption example-block)))
-         ;; (code-info (org-export-unravel-code example-block))
-         ;; (text (car code-info))
+         (code-info (org-export-unravel-code example-block))
+         (text (car code-info))
          )
     (if (not title) (setq title "[Example]"))
+    ;; ==============================================
+    ;; @deprecated: Example block cannot be exported correctly, we deprecated it since 2025-11-17.
+    (display-warning 'org-export-conf "Example block cannot be exported correctly, we deprecated it since 2025-11-17! Contents of block will be empty if exported." :warning "*Confluence Export Warning*")
+    ;; ==============================================
     (format
 "<ac:structured-macro ac:name=\"panel\">
   <ac:parameter ac:name=\"borderColor\">grey</ac:parameter>
   <ac:parameter ac:name=\"borderStyle\">dashed</ac:parameter>
   <ac:parameter ac:name=\"title\">%s</ac:parameter>
   <ac:rich-text-body>
-    <pre>%s</pre>
+%s
   </ac:rich-text-body>
-</ac:structured-macro>" title _contents)
+</ac:structured-macro>" title text)
     ))
 
 ;; Only by setting org-babel-exp-code-template will the
@@ -476,7 +492,7 @@ holding contextual information."
   </ac:rich-text-body>
 </ac:structured-macro>" width-conf contents)))
      ;; Others
-     (block-type "") ;; Just ignored.
+     (block-type contents) ;; Just return the original contents.
      )))
 
 (defun org-conf-src-block (src-block _contents info)
@@ -493,7 +509,7 @@ contextual information."
          (host (cdr (assoc :host pars)))
          (path (cdr (assoc :path pars)))
          (collapse (cdr (assoc :collapse pars)))
-         (title (car (org-export-get-caption src-block)))
+         (title (org-export-data (org-export-get-caption src-block) info))
          (env-comment "")
          )
     ;; Preprocess some parameters.
@@ -620,12 +636,12 @@ Givne filename as SOURCE, org-inlined ATTRIBUTES and export INFO."
       ;; SVG handling (always Base64 iframe)
       (with-temp-buffer
         (insert-file-contents source)
-        (let* ((base64-content (base64-encode-string (buffer-string)))
+        (let* ((base64-content (base64-encode-string (encode-coding-string (buffer-string) 'utf-8)))
                (width nil)
                (height nil)
                (aspect-ratio (when (string-match "viewBox=\"[^\"]*\"" (buffer-string))
                                (let ((viewbox (match-string 0 (buffer-string))))
-                                 (when (string-match "\\bviewBox=\"\\([0-9.]+\\) \\([0-9.]+\\) \\([0-9.]+\\) \\([0-9.]+\\)\"" viewbox)
+                                 (when (string-match "\\bviewBox=\"\\([0-9.-]+\\) \\([0-9.-]+\\) \\([0-9.]+\\) \\([0-9.]+\\)\"" viewbox)
                                    (setq width (match-string 3 viewbox))
                                    (setq height (match-string 4 viewbox))
                                    (format "%s/%s" width height)))))
@@ -637,12 +653,13 @@ Givne filename as SOURCE, org-inlined ATTRIBUTES and export INFO."
                                  :title ,(org-html--reference source info)
                                  :style ,(format "border:none; width:%s; height:auto; aspect-ratio:%s"
                                                  width
-                                                 (or aspect-ratio 16/9)
+                                                 (or aspect-ratio "16/9")
                                                  ))))))
           (concat "<iframe " iframe-attrs "></iframe>")))
 
     ;; Non-SVG case - call original function
-    (error "Not a svg file!")))
+    (funcall fun source attributes info))
+)
 
 (defun org-conf-link (link desc info)
   "Link parser"
@@ -1049,6 +1066,7 @@ information."
     (link . org-conf-link)
     (target . org-conf-target)
     (plain-text . org-html-plain-text)
+    (footnote-reference . org-html-footnote-reference)
     )
   :filters-alist
   '(

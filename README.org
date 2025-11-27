@@ -6,7 +6,7 @@
 #+export_exclude_tags: noexport
 #+property: HEADER-ARGS+ :eval no-export
 #+options: ^:{}
-Last updated Time-stamp: <2025-07-07 11:49:31>
+Last updated Time-stamp: <2025-11-27 15:48:06>
 # ===================================================================================
 # Hints:
 #   - Run M-x org-capture a to update the commentary in ox-conf.el.
@@ -55,7 +55,7 @@ Last updated Time-stamp: <2025-07-07 11:49:31>
                    (org-mark-subtree)
                    (forward-line)
                    (if (string= (buffer-substring-no-properties (region-beginning) (region-end)) new-content)
-                       (setq _msg "====> No new contents.")
+                       (setq _msg (format "====> No new contents in %s." sec-name))
                      (progn
                        (delete-region (region-beginning) (region-end))
                        (insert (get-comment))
@@ -141,6 +141,8 @@ Change Log:
                 Special block fall through to 'info-block'.
   - 2025-07-04: Added 'section' block and 'column' block.
   - 2025-07-07: Exported svg image as embedded html with <iframe>.
+  - 2025-11-17: Deprecated 'example-block'.
+  - 2025-11-27: Added 'footnote' support.
 
 * Example
 Given this file: =tmp.org=.
@@ -175,10 +177,16 @@ Run ~M-x org-export-dispatch f f~.
     - [[https://confluence.atlassian.com/conf59/section-macro-792499196.html][Section Macro | Atlassian Support | Atlassian Documentation]]
   - Column
     - [[https://confluence.atlassian.com/conf59/column-macro-792499085.html][Column Macro | Atlassian Support | Atlassian Documentation]]
+  - REST API
+    - [[https://docs.atlassian.com/atlassian-confluence/REST/6.6.0/#content-update]]
+    - [[https://developer.atlassian.com/server/confluence/confluence-rest-api-examples/]]
+    - https://developer.atlassian.com/cloud/confluence/rest/v1/intro/#using
 - Jira
   - [[https://docs.atlassian.com/software/jira/docs/api/REST/7.6.1/#api/2/issue-createIssues][JIRA 7.6.1]]
+  - [[https://docs.atlassian.com/jira-software/REST/7.3.1/#agile/1.0/issue-getIssue][JIRA Agile Server 7.4.0-SNAPSHOT REST API reference]]
   - [[https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-users/#api-group-users][The Jira Cloud platform REST API]]
   - [[https://developer.atlassian.com/server/jira-servicedesk/rest/v1000/api-group-user/#api-group-user][The Jira Service Management REST API]]
+  - https://developer.atlassian.com/cloud/jira/platform/rest/v2/intro/#about
   - [[https://confluence.atlassian.com/conf59/jira-issues-macro-792499129.html][JIRA Issues Macro | Confluence Data Center 5.9 | Atlassian Documentation]]
   - Jira chart
     - [[https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html][JIRA Chart Macro | Confluence Data Center 5.9 | Atlassian Documentation]]
