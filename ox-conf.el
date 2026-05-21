@@ -74,6 +74,7 @@
 ;;   - 2025-07-07: Exported svg image as embedded html with <iframe>.
 ;;   - 2025-11-17: Deprecated 'example-block'.
 ;;   - 2025-11-27: Added 'footnote' support.
+;;   - 2026-05-21: Added 'f o' dispatch action to open conf page.
 
 
 ;;; Code:
@@ -148,6 +149,16 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
          )
     _id
     ))
+
+(defun org-conf-turn-on-debug ()
+  "Turn on debug mode."
+  (interactive)
+  (setq org-conf-log-level 'blather))
+
+(defun org-conf-turn-off-debug ()
+  "Turn off debug mode."
+  (interactive)
+  (setq org-conf-log-level -1))
 
 (define-skeleton ske-conf
   "Quick insert the required options."
@@ -376,7 +387,8 @@ contextual information."
 
 ;; Special blocks
 (add-to-list 'org-structure-template-alist '("w" . "warning"))
-(add-to-list 'org-structure-template-alist '("n" . "note"))
+(unless (assoc "n" org-structure-template-alist)
+  (add-to-list 'org-structure-template-alist '("n" . "note")))
 (add-to-list 'org-structure-template-alist '("t" . "tip"))
 (add-to-list 'org-structure-template-alist '("p" . "expand"))
 (add-to-list 'org-structure-template-alist '("y" . "history"))
@@ -1048,6 +1060,13 @@ information."
   (message "Password cache has been forgotten!")
   )
 
+(defun org-conf-open-page
+    (&optional async subtreep visible-only body-only ext-plist)
+  "Open the confluence URL for you."
+  (interactive)
+  (let ((conf-page (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-page))
+        )
+    (browse-url conf-page)))
 
 ;;; ======================================================================
 ;;;                          Export Backend                             
@@ -1078,6 +1097,7 @@ information."
   '(
     (:html-text-markup-alist nil nil org-conf-text-markup-alist nil)
     (:conf-id "CONF_ID" nil nil t)
+    (:conf-page "CONF_PAGE" nil nil t)
     (:conf-space "CONF_SPACE" nil org-conf-default-space t)
     )
   :menu-entry
@@ -1088,6 +1108,7 @@ information."
       (?f "To Confluence" org-conf-export-to-conf)
       (?w "To Confluence (w/o POST)" org-conf-export-to-conf-without-post)
       (?r "Forget the wrong password" org-conf-forget-password)
+      (?o "Open page" org-conf-open-page)
       ))
   )
 

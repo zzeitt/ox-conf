@@ -6,7 +6,7 @@
 #+export_exclude_tags: noexport
 #+property: HEADER-ARGS+ :eval no-export
 #+options: ^:{}
-Last updated Time-stamp: <2025-11-27 15:48:06>
+Last updated Time-stamp: <2026-05-21 16:53:13>
 # ===================================================================================
 # Hints:
 #   - Run M-x org-capture a to update the commentary in ox-conf.el.
@@ -143,6 +143,7 @@ Change Log:
   - 2025-07-07: Exported svg image as embedded html with <iframe>.
   - 2025-11-17: Deprecated 'example-block'.
   - 2025-11-27: Added 'footnote' support.
+  - 2026-05-21: Added 'f o' dispatch action to open conf page.
 
 * Example
 Given this file: =tmp.org=.
