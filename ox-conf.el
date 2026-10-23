@@ -1046,14 +1046,31 @@ FREQ itself is not modified."
       (push (cons id 1) new))
     new))
 
+(defconst org-conf--front-matter-comment-regexp
+  "^[ \t]*\\(?:#!\\|# -*-\\|#\\(?:[ \t]\\|$\\)\\)"
+  "A shebang, an Emacs mode line, or an org comment line.")
+
+(defun org-conf--front-matter-start ()
+  "Return the position where the leading #+ keyword block begins.
+Blank lines, shebangs, mode lines and org comments before the block are
+skipped, so nothing is ever inserted above them."
+  (save-excursion
+    (goto-char (point-min))
+    (while (and (not (eobp))
+                (or (looking-at-p "^[ \t]*$")
+                    (looking-at-p org-conf--front-matter-comment-regexp)))
+      (forward-line 1))
+    (point)))
+
 (defun org-conf--keyword-block-end ()
   "Return the position just after the file's leading #+ keyword block.
 That is where new keywords belong: after #+TITLE: and friends, but
-before any blank line or body text.  Returns `point-min' when the file
-does not start with keywords."
+before any blank line or body text.  Leading shebangs, mode lines and
+org comments are skipped, so the block never starts above them.  Returns
+the front-matter start when the file has no keyword block."
   (save-excursion
-    (goto-char (point-min))
-    (let ((end (point-min)))
+    (goto-char (org-conf--front-matter-start))
+    (let ((end (point)))
       (while (and (not (eobp)) (org-at-keyword-p))
         (forward-line 1)
         (setq end (point)))

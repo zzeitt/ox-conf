@@ -324,6 +324,46 @@
       (should (equal "DOCS" (plist-get options :conf-space)))
       (should (equal "http://x/pages/1/T" (plist-get options :conf-page))))))
 
+(ert-deftest ox-conf-test-insert-keywords-lands-below-a-mode-line ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "# -*- mode: org; -*-\n#+TITLE: My Doc\n\nBody\n")
+    (org-conf--insert-conf-keywords "DOCS" "http://x/pages/1/T" "1")
+    (should (equal (concat "# -*- mode: org; -*-\n"
+                           "#+TITLE: My Doc\n"
+                           "#+CONF_SPACE: DOCS\n"
+                           "#+CONF_PAGE: http://x/pages/1/T\n"
+                           "#+CONF_ID: 1\n"
+                           "\nBody\n")
+                   (buffer-string)))))
+
+(ert-deftest ox-conf-test-insert-keywords-never-goes-above-a-shebang ()
+  "Without keywords, the block still stays below the shebang."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#!/usr/bin/env org\n\nBody\n")
+    (org-conf--insert-conf-keywords "DOCS" "http://x/pages/1/T" "1")
+    (should (equal (concat "#!/usr/bin/env org\n"
+                           "\n"
+                           "#+CONF_SPACE: DOCS\n"
+                           "#+CONF_PAGE: http://x/pages/1/T\n"
+                           "#+CONF_ID: 1\n"
+                           "Body\n")
+                   (buffer-string)))))
+
+(ert-deftest ox-conf-test-insert-keywords-normalises-stale-lines-below-a-mode-line ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "# -*- mode: org; -*-\n#+CONF_ID: 1\n#+TITLE: T\n\nBody\n")
+    (org-conf--insert-conf-keywords "DOCS" "http://x/pages/1/T" "1")
+    (should (equal (concat "# -*- mode: org; -*-\n"
+                           "#+TITLE: T\n"
+                           "#+CONF_SPACE: DOCS\n"
+                           "#+CONF_PAGE: http://x/pages/1/T\n"
+                           "#+CONF_ID: 1\n"
+                           "\nBody\n")
+                   (buffer-string)))))
+
 ;;; ----------------------------------------------------------------------
 ;;; org-conf--parent-choices: the completing-read collection.
 ;;; ----------------------------------------------------------------------
@@ -549,6 +589,20 @@
   (with-temp-buffer
     (org-mode)
     (should (equal (point-min) (org-conf--keyword-block-end)))))
+
+(ert-deftest ox-conf-test-keyword-block-end-skips-a-mode-line ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "# -*- mode: org; -*-\n#+TITLE: T\n\nBody\n")
+    (should (equal (ox-conf-test--after-line 2)
+                   (org-conf--keyword-block-end)))))
+
+(ert-deftest ox-conf-test-keyword-block-end-skips-blank-lines-before-keywords ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "# -*- mode: org; -*-\n\n#+TITLE: T\n#+AUTHOR: A\n\nBody\n")
+    (should (equal (ox-conf-test--after-line 4)
+                   (org-conf--keyword-block-end)))))
 
 ;;; ----------------------------------------------------------------------
 ;;; org-conf--unique-labels: keep every completing-read choice distinct.
