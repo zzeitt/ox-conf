@@ -1370,7 +1370,15 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
      (:create-page . org-conf-rest-post-page)
      (:update-page . org-conf-rest-put)
      (:list-attachments . org-conf-rest-list-attachments)
-     (:upload-attachment . org-conf-rest-post-file)))
+     (:upload-attachment . org-conf-rest-post-file))
+    (cli
+     (:get-page-info . org-conf-cli-get-page-info)
+     (:get-children . org-conf-cli-get-children)
+     (:get-space-roots . org-conf-cli-get-space-roots)
+     (:create-page . org-conf-cli-create-page)
+     (:update-page . org-conf-cli-update-page)
+     (:list-attachments . org-conf-cli-list-attachments)
+     (:upload-attachment . org-conf-cli-upload-attachment)))
   "Backend implementations, as an alist of BACKEND . ((OP . FUNCTION) ...).")
 
 (defun org-conf--backend-fn (op)
@@ -1487,6 +1495,15 @@ when the CLI exits non-zero or prints something that is not JSON."
                          (error-message-string err)))))
       (delete-file stderr))))
 
+(defvar org-conf--cli-json-function #'org-conf--cli-json
+  "Function used to run the CLI and parse its JSON.
+Rebind this (in tests or an alternative front end) to replace the
+transport without redefining `org-conf--cli-json'.")
+
+(defun org-conf--cli-invoke (&rest args)
+  "Call `org-conf--cli-json-function' with ARGS."
+  (apply org-conf--cli-json-function args))
+
 (defun org-conf--write-utf8-file (text)
   "Write TEXT to a fresh UTF-8 temporary file and return its name."
   (let ((file (make-temp-file "ox-conf-body-" nil ".html"))
@@ -1501,6 +1518,82 @@ when the CLI exits non-zero or prints something that is not JSON."
     (unwind-protect
         (funcall fn file)
       (delete-file file))))
+
+;;; ======================================================================
+;;;                   confluence-cli Backend Operations
+;;; ======================================================================
+(defun org-conf--cli-api-path (api)
+  "Turn a REST API path into one relative to the CLI's `apiPath'."
+  (replace-regexp-in-string "\\`/*\\(?:rest/api/\\)?" "" api))
+
+(defun org-conf-cli-get-page-info (page-id)
+  "Return PAGE-ID's metadata as a plist from the confluence CLI."
+  (let ((json (org-conf--cli-invoke "info" page-id)))
+    (list :id (alist-get 'id json)
+          :title (alist-get 'title json)
+          :version (alist-get 'version json)
+          :space (alist-get 'spaceKey json)
+          :parent-id (alist-get 'parentId json)
+          :url (alist-get 'url json))))
+
+(defun org-conf-cli-get-children (page-id)
+  "Return PAGE-ID's direct children as (:id :title) plists."
+  (mapcar (lambda (child)
+            (list :id (alist-get 'id child)
+                  :title (alist-get 'title child)))
+          (alist-get 'children (org-conf--cli-invoke "children" page-id))))
+
+(defun org-conf-cli-get-space-roots (space)
+  "Return SPACE's top-level pages as (:id :title) plists."
+  (let ((api (org-conf--cli-api-path (org-conf--space-root-page-api space)))
+        (pages nil)
+        (requests 0))
+    (while (and api (< requests org-conf--max-child-page-requests))
+      (let ((json (org-conf--cli-invoke "api" api)))
+        (setq pages (append pages (org-conf--parse-child-page-json json)))
+        (setq api (org-conf--page-json-next json))
+        (setq requests (1+ requests))))
+    pages))
+
+(defun org-conf-cli-create-page (title space parent-id)
+  "Create a page titled TITLE in SPACE under PARENT-ID through the CLI.
+Return a (:id :webui) plist; :webui is the CLI's absolute page URL."
+  (let ((json (org-conf--with-temp-body
+                  ""
+                (lambda (file)
+                  (if parent-id
+                      (org-conf--cli-invoke "create-child" title parent-id
+                                            "--file" file)
+                    (org-conf--cli-invoke "create" title space "--file" file))))))
+    (list :id (alist-get 'id json)
+          :webui (alist-get 'url json))))
+
+(defun org-conf-cli-update-page (page-id title space body version message)
+  "Update PAGE-ID through the CLI.
+SPACE, VERSION and MESSAGE are accepted for interface compatibility and
+ignored: the CLI fetches the current version itself."
+  (org-conf--with-temp-body
+      body
+    (lambda (file)
+      (apply #'org-conf--cli-invoke
+             (append (list "update" page-id)
+                     (unless (string-empty-p (or title ""))
+                       (list "--title" title))
+                     (list "--file" file "--format" "storage"))))))
+
+(defun org-conf-cli-list-attachments (page-id)
+  "Return PAGE-ID's attachments as (:id :title) plists from the CLI."
+  (mapcar (lambda (attachment)
+            (list :id (alist-get 'id attachment)
+                  :title (alist-get 'title attachment)))
+          (alist-get 'attachments (org-conf--cli-invoke "attachments" page-id))))
+
+(defun org-conf-cli-upload-attachment (page-id filepath &optional attach-id)
+  "Upload FILEPATH to PAGE-ID through the CLI.
+ATTACH-ID only signals that an existing attachment should be replaced."
+  (apply #'org-conf--cli-invoke
+         (append (list "attachment-upload" page-id "--file" filepath)
+                 (when attach-id (list "--replace")))))
 
 (defun org-conf--upload-img (conf-id link)
   "Given image file or attachment's path LINK, upload it to conf page with CONF-ID.

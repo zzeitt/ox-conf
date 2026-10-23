@@ -530,6 +530,121 @@
     (should-not (file-exists-p path))))
 
 ;;; ----------------------------------------------------------------------
+;;; The CLI backend operations and their command lines.
+;;; ----------------------------------------------------------------------
+
+(ert-deftest ox-conf-test-cli-api-path-removes-the-rest-prefix ()
+  (should (equal "space/DOCS/content?depth=root&limit=200"
+                 (org-conf--cli-api-path
+                  "/rest/api/space/DOCS/content?depth=root&limit=200")))
+  (should (equal "content/1/child/page?limit=200"
+                 (org-conf--cli-api-path "/rest/api/content/1/child/page?limit=200"))))
+
+(ert-deftest ox-conf-test-cli-get-page-info-maps-json ()
+  (cl-letf (((symbol-value 'org-conf--cli-json-function)
+             (lambda (&rest args)
+               (should (equal '("info" "7") args))
+               '((id . "7") (title . "Doc") (version . 3)
+                 (spaceKey . "DOCS") (parentId . "5")
+                 (url . "http://x/pages/7")))))
+    (should (equal '(:id "7" :title "Doc" :version 3 :space "DOCS"
+                     :parent-id "5" :url "http://x/pages/7")
+                   (org-conf-cli-get-page-info "7")))))
+
+(ert-deftest ox-conf-test-cli-get-children-maps-json ()
+  (cl-letf (((symbol-value 'org-conf--cli-json-function)
+             (lambda (&rest args)
+               (should (equal '("children" "7") args))
+               '((children . (((id . "8") (title . "Kid"))))))))
+    (should (equal '((:id "8" :title "Kid"))
+                   (org-conf-cli-get-children "7")))))
+
+(ert-deftest ox-conf-test-cli-get-space-roots-reads-grouped-api-output ()
+  (let ((calls nil)
+        (org-conf-parent-child-page-limit 200))
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args)
+                 (push args calls)
+                 '((page . ((results . [((id . "1") (title . "Root"))])))))))
+      (should (equal '((:id "1" :title "Root"))
+                     (org-conf-cli-get-space-roots "DOCS")))
+      (should (equal '("api" "space/DOCS/content?depth=root&limit=200")
+                     (car calls))))))
+
+(ert-deftest ox-conf-test-cli-get-space-roots-follows-a-grouped-next-link ()
+  (let ((calls nil)
+        (org-conf-parent-child-page-limit 1))
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args)
+                 (push (cadr args) calls)
+                 (if (equal (cadr args) "space/DOCS/content?depth=root&limit=1")
+                     '((page . ((results . [((id . "1") (title . "A"))])
+                                (_links . ((next . "https://x/next"))))))
+                   '((page . ((results . [((id . "2") (title . "B"))]))))))))
+      (should (equal '((:id "1" :title "A") (:id "2" :title "B"))
+                     (org-conf-cli-get-space-roots "DOCS")))
+      (should (equal '("space/DOCS/content?depth=root&limit=1"
+                       "https://x/next")
+                     (nreverse calls))))))
+
+(ert-deftest ox-conf-test-cli-create-page-uses-create-child-and-a-body-file ()
+  (let (captured)
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args)
+                 (setq captured args)
+                 '((id . "9") (url . "http://x/pages/9")))))
+      (should (equal '(:id "9" :webui "http://x/pages/9")
+                     (org-conf-cli-create-page "Doc" "DOCS" "5")))
+      (should (equal "create-child" (car captured)))
+      (should (equal "Doc" (nth 1 captured)))
+      (should (equal "5" (nth 2 captured)))
+      (should (member "--file" captured)))))
+
+(ert-deftest ox-conf-test-cli-create-page-at-the-space-root ()
+  (let (captured)
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args)
+                 (setq captured args)
+                 '((id . "9") (url . "http://x/pages/9")))))
+      (org-conf-cli-create-page "Doc" "DOCS" nil)
+      (should (equal '("create" "Doc" "DOCS") (seq-take captured 3))))))
+
+(ert-deftest ox-conf-test-cli-update-page-writes-the-body-and-omits-a-blank-title ()
+  (let (captured)
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (let ((file (cadr (member "--file" args))))
+                   (should (equal "<p>hi</p>"
+                                  (with-temp-buffer
+                                    (insert-file-contents file)
+                                    (buffer-string)))))
+                 '((version . 2)))))
+      (org-conf-cli-update-page "9" "" "DOCS" "<p>hi</p>" 1 "")
+      (should (equal '("update" "9") (seq-take captured 2)))
+      (should (member "--file" captured))
+      (should (member "--format" captured))
+      (should (equal "storage"
+                     (nth (1+ (seq-position captured "--format")) captured)))
+      (should-not (member "--title" captured)))))
+
+(ert-deftest ox-conf-test-cli-list-attachments-maps-json ()
+  (cl-letf (((symbol-value 'org-conf--cli-json-function)
+             (lambda (&rest args)
+               (should (equal '("attachments" "9") args))
+               '((attachments . (((id . "a1") (title . "a.png"))))))))
+    (should (equal '((:id "a1" :title "a.png"))
+                   (org-conf-cli-list-attachments "9")))))
+
+(ert-deftest ox-conf-test-cli-upload-attachment-adds-replace ()
+  (let (captured)
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args) (setq captured args) '((uploaded . [])))))
+      (org-conf-cli-upload-attachment "9" "/tmp/a.png" "a1")
+      (should (equal '("attachment-upload" "9" "--file" "/tmp/a.png" "--replace")
+                     captured)))))
+
+;;; ----------------------------------------------------------------------
 ;;; org-conf--json-link: pull a rel out of a JSON _links object.
 ;;; ----------------------------------------------------------------------
 
