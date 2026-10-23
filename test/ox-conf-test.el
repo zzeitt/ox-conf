@@ -423,6 +423,57 @@
   (let ((org-conf-url "http://wiki.example.com"))
     (should (equal "" (org-conf--page-url nil)))))
 
+(ert-deftest ox-conf-test-page-url-passes-an-absolute-url-through ()
+  (let ((org-conf-url "http://wiki.example.com/"))
+    (should (equal "https://other.example.com/pages/1"
+                   (org-conf--page-url "https://other.example.com/pages/1")))))
+
+;;; ----------------------------------------------------------------------
+;;; Backend selection and the REST adapter.
+;;; ----------------------------------------------------------------------
+
+(ert-deftest ox-conf-test-active-backend-honours-an-explicit-choice ()
+  (let ((org-conf-backend 'rest)) (should (eq 'rest (org-conf--active-backend))))
+  (let ((org-conf-backend 'cli)) (should (eq 'cli (org-conf--active-backend)))))
+
+(ert-deftest ox-conf-test-active-backend-auto-prefers-the-cli ()
+  (let ((org-conf-backend 'auto))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_program) "/usr/bin/confluence")))
+      (should (eq 'cli (org-conf--active-backend))))))
+
+(ert-deftest ox-conf-test-active-backend-auto-falls-back-to-rest ()
+  (let ((org-conf-backend 'auto))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_program) nil)))
+      (should (eq 'rest (org-conf--active-backend))))))
+
+(ert-deftest ox-conf-test-rest-get-page-info-builds-a-plist ()
+  (let ((json '((id . "7")
+                (title . "Doc")
+                (version . ((number . 3)))
+                (space . ((key . "DOCS")))
+                (ancestors . [((id . "1") (title . "Root"))
+                              ((id . "5") (title . "Parent"))])
+                (_links . ((webui . "/spaces/DOCS/pages/7/Doc"))))))
+    (cl-letf (((symbol-function 'org-conf-rest-get-page-json)
+               (lambda (_id) json)))
+      (let ((org-conf-backend 'rest)
+            (org-conf-url "http://wiki.example.com/"))
+        (should (equal '(:id "7" :title "Doc" :version 3 :space "DOCS"
+                         :parent-id "5"
+                         :url "http://wiki.example.com/spaces/DOCS/pages/7/Doc")
+                       (org-conf-backend-get-page-info "7")))))))
+
+(ert-deftest ox-conf-test-rest-list-attachments-builds-id-title-plists ()
+  (let ((json '(:results [(:id "a1" :title "a.png")
+                          (:id "a2" :title "b.png")])))
+    (cl-letf (((symbol-function 'org-conf-rest-get-attach-json)
+               (lambda (_id) json)))
+      (let ((org-conf-backend 'rest))
+        (should (equal '((:id "a1" :title "a.png")
+                         (:id "a2" :title "b.png"))
+                       (org-conf-backend-list-attachments "7")))))))
+
 ;;; ----------------------------------------------------------------------
 ;;; org-conf--json-link: pull a rel out of a JSON _links object.
 ;;; ----------------------------------------------------------------------
@@ -516,20 +567,21 @@
                     ((symbol-function 'completing-read)
                      ;; Pick the root page rather than "create at space root".
                      (lambda (_prompt collection &rest _) (caadr collection)))
-                    ((symbol-function 'org-conf-rest-get-page-node)
-                     (lambda (id) (list :id id :title "Root")))
-                    ((symbol-function 'org-conf-rest-get-children)
+                    ((symbol-function 'org-conf-backend-get-page-info)
+                     (lambda (id)
+                       (if (equal id "999")
+                           (list :id id :title "Root" :version 0)
+                         (list :id id :title "My Doc" :version 0))))
+                    ((symbol-function 'org-conf-backend-get-children)
                      (lambda (_id) nil))
-                    ((symbol-function 'org-conf-rest-post-page)
+                    ((symbol-function 'org-conf-backend-create-page)
                      (lambda (title space parent-id)
                        (setq posted (list title space parent-id))
                        (list :id "555"
                              :webui "/spaces/DOCS/pages/555/My+Doc")))
-                    ((symbol-function 'org-conf-rest-get-page-json)
-                     (lambda (_id) '((version . ((number . 0))))))
                     ((symbol-function 'org-export-as)
                      (lambda (&rest _) "<p>body</p>"))
-                    ((symbol-function 'org-conf-rest-put)
+                    ((symbol-function 'org-conf-backend-update-page)
                      (lambda (&rest args) (setq put args))))
             (org-conf-create-page-and-export)
             (should (equal '("My Doc" "DOCS" "999") posted))
@@ -679,9 +731,9 @@ list of menus that were shown, in order.  The getter is repeatable."
                 '("Alpha" "Alpha-1" "✓ 就用「Alpha-1」作为父页面")))
          (menus (cdr stub)))
     (cl-letf (((symbol-function 'completing-read) (car stub))
-              ((symbol-function 'org-conf-rest-get-space-roots)
+              ((symbol-function 'org-conf-backend-get-space-roots)
                (lambda (_space) '((:id "1" :title "Alpha"))))
-              ((symbol-function 'org-conf-rest-get-children)
+              ((symbol-function 'org-conf-backend-get-children)
                (lambda (id) (cdr (assoc id '(("1" (:id "2" :title "Alpha-1"))))))))
       (should (equal "2" (org-conf--read-parent-by-drill-down "DOCS")))
       ;; Three menus: the space top, inside Alpha, then standing on the leaf.
@@ -695,7 +747,7 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-drill-down-can-stop-at-the-space-root ()
   (let ((stub (ox-conf-test--drill-stub '("（建在 space 根目录）"))))
     (cl-letf (((symbol-function 'completing-read) (car stub))
-              ((symbol-function 'org-conf-rest-get-space-roots)
+              ((symbol-function 'org-conf-backend-get-space-roots)
                (lambda (_space) '((:id "1" :title "Alpha")))))
       (should (null (org-conf--read-parent-by-drill-down "DOCS"))))))
 
@@ -705,9 +757,9 @@ list of menus that were shown, in order.  The getter is repeatable."
                 '("Alpha" "↑ 返回上一层" "（建在 space 根目录）")))
          (menus (cdr stub)))
     (cl-letf (((symbol-function 'completing-read) (car stub))
-              ((symbol-function 'org-conf-rest-get-space-roots)
+              ((symbol-function 'org-conf-backend-get-space-roots)
                (lambda (_space) '((:id "1" :title "Alpha"))))
-              ((symbol-function 'org-conf-rest-get-children)
+              ((symbol-function 'org-conf-backend-get-children)
                (lambda (_id) '((:id "2" :title "Alpha-1")))))
       (should (null (org-conf--read-parent-by-drill-down "DOCS")))
       (should (member "Alpha-1" (nth 1 (funcall menus))))
@@ -719,7 +771,7 @@ list of menus that were shown, in order.  The getter is repeatable."
     (cl-letf (((symbol-function 'completing-read) (car stub))
               ((symbol-function 'read-string)
                (lambda (&rest _) "https://wiki.example.com/pages/777"))
-              ((symbol-function 'org-conf-rest-get-space-roots)
+              ((symbol-function 'org-conf-backend-get-space-roots)
                (lambda (_space) '((:id "1" :title "Alpha")))))
       (should (equal "777" (org-conf--read-parent-by-drill-down "DOCS"))))))
 
@@ -742,9 +794,9 @@ list of menus that were shown, in order.  The getter is repeatable."
         (org-conf-parent-freq-file (make-temp-file "ox-conf-freq" nil ".eld"))
         (menus nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'org-conf-rest-get-page-node)
+        (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
                    (lambda (id) (list :id id :title "Root")))
-                  ((symbol-function 'org-conf-rest-get-children)
+                  ((symbol-function 'org-conf-backend-get-children)
                    (lambda (_id) nil))
                   ((symbol-function 'read-string)
                    (lambda (&rest _) "https://wiki.example.com/pages/777"))

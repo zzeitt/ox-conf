@@ -156,6 +156,20 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
                  (const :tag "Level TRACE" trace)
                  (const :tag "Level BLATHER" blather)))
 
+(defcustom org-conf-backend 'auto
+  "Which Confluence backend to use.
+`auto' prefers the confluence CLI when `org-conf-cli-program' is found
+on `exec-path', and falls back to the REST API otherwise."
+  :type '(choice (const :tag "Auto (CLI when installed)" auto)
+                 (const :tag "REST API (request.el)" rest)
+                 (const :tag "confluence CLI" cli))
+  :group 'org-export-conf)
+
+(defcustom org-conf-cli-program "confluence"
+  "Executable used by the `cli' backend."
+  :type 'string
+  :group 'org-export-conf)
+
 (defconst org-conf--log-level-def
   '(;; debugging
     (blather . 60) (trace . 50) (debug . 40)
@@ -1168,12 +1182,14 @@ A whitespace-only ORG-TITLE counts as absent."
         "")))
 
 (defun org-conf--page-url (webui)
-  "Expand WEBUI, a host-relative page path, into a full Confluence URL.
+  "Expand WEBUI, a page path or an absolute URL, into a full URL.
+Absolute URLs (as returned by the CLI backend) pass through unchanged.
 Returns the empty string when WEBUI is nil, so a missing _links entry
 cannot produce a broken #+CONF_PAGE:."
-  (if webui
-      (org-conf--return-api-url webui)
-    ""))
+  (cond
+   ((not webui) "")
+   ((string-match-p "\\`https?://" webui) webui)
+   (t (org-conf--return-api-url webui))))
 
 ;;; ======================================================================
 ;;;                          Request Methods
@@ -1182,7 +1198,7 @@ cannot produce a broken #+CONF_PAGE:."
   "Retrieve a Confluence page's status information using GET method."
   (request-response-data
     (request
-      (org-conf--return-api-url (format "/rest/api/content/%s?&expand=version.number" conf-id))
+      (org-conf--return-api-url (format "/rest/api/content/%s?expand=version.number,space,_links,ancestors" conf-id))
       :auth "basic"
       ;; Parser is like the post-process in export backend,
       ;; the data used in "success" function will be processed
@@ -1334,21 +1350,101 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
     )
   )
 
+;;; ======================================================================
+;;;                          Backend Dispatch
+;;; ======================================================================
+(defun org-conf--active-backend ()
+  "Return the backend to use: `rest' or `cli'.
+`auto' prefers the CLI when `org-conf-cli-program' is on `exec-path'."
+  (pcase org-conf-backend
+    ('cli 'cli)
+    ('rest 'rest)
+    ('auto (if (executable-find org-conf-cli-program) 'cli 'rest))
+    (_ (user-error "Unknown `org-conf-backend': %S" org-conf-backend))))
+
+(defvar org-conf--backend-functions
+  '((rest
+     (:get-page-info . org-conf-rest-get-page-info)
+     (:get-children . org-conf-rest-get-children)
+     (:get-space-roots . org-conf-rest-get-space-roots)
+     (:create-page . org-conf-rest-post-page)
+     (:update-page . org-conf-rest-put)
+     (:list-attachments . org-conf-rest-list-attachments)
+     (:upload-attachment . org-conf-rest-post-file)))
+  "Backend implementations, as an alist of BACKEND . ((OP . FUNCTION) ...).")
+
+(defun org-conf--backend-fn (op)
+  "Return the function implementing OP for the active backend."
+  (or (cdr (assq op (alist-get (org-conf--active-backend)
+                               org-conf--backend-functions)))
+      (user-error "Backend %s does not implement %s"
+                  (org-conf--active-backend) op)))
+
+(defun org-conf-backend-get-page-info (page-id)
+  "Return metadata for PAGE-ID from the active backend."
+  (funcall (org-conf--backend-fn :get-page-info) page-id))
+
+(defun org-conf-backend-get-children (page-id)
+  "Return PAGE-ID's direct children from the active backend."
+  (funcall (org-conf--backend-fn :get-children) page-id))
+
+(defun org-conf-backend-get-space-roots (space)
+  "Return SPACE's top-level pages from the active backend."
+  (funcall (org-conf--backend-fn :get-space-roots) space))
+
+(defun org-conf-backend-create-page (title space parent-id)
+  "Create a page through the active backend."
+  (funcall (org-conf--backend-fn :create-page) title space parent-id))
+
+(defun org-conf-backend-update-page (page-id title space body version message)
+  "Update PAGE-ID through the active backend."
+  (funcall (org-conf--backend-fn :update-page)
+           page-id title space body version message))
+
+(defun org-conf-backend-list-attachments (page-id)
+  "Return PAGE-ID's attachments from the active backend."
+  (funcall (org-conf--backend-fn :list-attachments) page-id))
+
+(defun org-conf-backend-upload-attachment (page-id filepath &optional attach-id)
+  "Upload FILEPATH to PAGE-ID through the active backend."
+  (funcall (org-conf--backend-fn :upload-attachment)
+           page-id filepath attach-id))
+
+(defun org-conf-rest-get-page-info (page-id)
+  "Return PAGE-ID's metadata as a plist from the REST API.
+Keys: :id, :title, :version, :space, :parent-id and :url."
+  (let ((json (org-conf-rest-get-page-json page-id)))
+    (when json
+      (let ((ancestors (append (cdr (assoc 'ancestors json)) nil)))
+        (list :id (or (cdr (assoc 'id json)) page-id)
+              :title (cdr (assoc 'title json))
+              :version (cdr (assoc 'number (assoc 'version json)))
+              :space (cdr (assoc 'key (assoc 'space json)))
+              :parent-id (cdr (assoc 'id (car (last ancestors))))
+              :url (org-conf--page-url (org-conf--json-link json 'webui)))))))
+
+(defun org-conf-rest-list-attachments (page-id)
+  "Return PAGE-ID's attachments as (:id :title) plists from the REST API."
+  (mapcar (lambda (attachment)
+            (list :id (plist-get attachment :id)
+                  :title (plist-get attachment :title)))
+          (append (plist-get (org-conf-rest-get-attach-json page-id) :results)
+                  nil)))
+
 (defun org-conf--upload-img (conf-id link)
   "Given image file or attachment's path LINK, upload it to conf page with CONF-ID.
-@done: Ask for replace or not if image exists."
-  (let* ((attach-json (org-conf-rest-get-attach-json conf-id))
+Ask for confirmation when an attachment with the same name exists."
+  (let* ((attachments (org-conf-backend-list-attachments conf-id))
          (filename (file-name-nondirectory link))
-         (attach-id (org-conf--parse-attach-json
-                     attach-json filename)))
+         (attach-id (plist-get (seq-find
+                                (lambda (attachment)
+                                  (equal filename (plist-get attachment :title)))
+                                attachments)
+                               :id)))
     (if attach-id
-        ;; Existed attachment will be asked first
-        (if (y-or-n-p (format "Attachment '%s' already exists, replace?" filename))
-            (org-conf-rest-post-file conf-id link attach-id))
-      ;; New attatchment will be uploaded
-      (org-conf-rest-post-file conf-id link attach-id)
-      )
-    ))
+        (when (y-or-n-p (format "Attachment '%s' already exists, replace?" filename))
+          (org-conf-backend-upload-attachment conf-id link attach-id))
+      (org-conf-backend-upload-attachment conf-id link nil))))
 
 
 ;;; ======================================================================
@@ -1389,9 +1485,9 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
         (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
         (res nil))
     (if conf-id
-        (progn
-          (setq res (org-conf-rest-get-page-json conf-id))
-          (org-conf-page-json-parser res))
+        (let ((info (org-conf-backend-get-page-info conf-id)))
+          (message "===> Title is: %s, version is: %s"
+                   (plist-get info :title) (plist-get info :version)))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-img-info
@@ -1404,9 +1500,10 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
         (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
         (res nil))
     (if conf-id
-        (progn
-          (setq res (org-conf-rest-get-attach-json conf-id))
-          (org-conf--parse-attach-json res))
+        (dolist (attachment (org-conf-backend-list-attachments conf-id))
+          (message "===> Image info: title is %s, ID is %s."
+                   (plist-get attachment :title)
+                   (plist-get attachment :id)))
       (message "No CONF_ID found!"))))
 
 (defun org-conf--read-space ()
@@ -1444,7 +1541,7 @@ Return nil when the answer is blank, meaning the space root."
 An empty list means either an empty space or that this Confluence
 rejected `depth=root'; either way the user needs to be told rather than
 shown a menu with nothing in it."
-  (let ((roots (org-conf-rest-get-space-roots space)))
+  (let ((roots (org-conf-backend-get-space-roots space)))
     (unless roots
       (message "Space %s listed no top-level pages; type a page URL instead."
                space))
@@ -1460,7 +1557,7 @@ nil when the user settles on the space root itself."
         (answer 'pending))
     (while (eq answer 'pending)
       (let* ((children (if current
-                           (org-conf-rest-get-children (plist-get current :id))
+                           (org-conf-backend-get-children (plist-get current :id))
                          (org-conf--space-roots-or-warn space)))
              (choices (org-conf--drill-choices current children))
              (action (cdr (assoc (completing-read "Parent page: " choices nil t)
@@ -1491,7 +1588,7 @@ a URL can still be typed by hand."
                root)
       (org-conf--read-parent-id-manually))
      (t
-      (let ((node (org-conf-rest-get-page-node
+      (let ((node (org-conf-backend-get-page-info
                    (org-conf--return-id-from-url root))))
         (if (not (plist-get node :title))
             (progn
@@ -1499,7 +1596,7 @@ a URL can still be typed by hand."
                        (plist-get node :id))
               (org-conf--read-parent-id-manually))
           (let* ((candidates (org-conf--collect-descendants
-                              node #'org-conf-rest-get-children
+                              node #'org-conf-backend-get-children
                               org-conf-parent-max-pages))
                  (sorted (org-conf--sort-parent-candidates
                           candidates
@@ -1523,7 +1620,7 @@ uploaded.  Nothing is written when Confluence refuses the creation."
   (let* ((space (org-conf--read-space))
          (title (org-conf--read-title))
          (parent-id (org-conf--read-parent-id space))
-         (created (org-conf-rest-post-page title space parent-id))
+         (created (org-conf-backend-create-page title space parent-id))
          (page-id (plist-get created :id)))
     (unless page-id
       (user-error "Confluence did not create the page; the buffer is untouched"))
@@ -1539,7 +1636,7 @@ uploaded.  Nothing is written when Confluence refuses the creation."
 
 (defun org-conf-export-to-conf
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export to Confluence by calling `org-conf-rest-put function.
+  "Export to Confluence through the active backend.
 When the buffer has no #+CONF_ID yet, create a Confluence page for it
 first; see `org-conf-create-page-and-export'."
   (interactive)
@@ -1557,8 +1654,8 @@ first; see `org-conf-create-page-and-export'."
     (if (eq 'update (org-conf--export-action conf-id))
         (progn
           ;; Update page version number.
-          (setq res (org-conf-rest-get-page-json conf-id))
-          (setq version (1+ (cdr (assoc 'number (assoc 'version res)))))
+          (setq res (org-conf-backend-get-page-info conf-id))
+          (setq version (1+ (or (plist-get res :version) 0)))
           ;; Pass export parameters through communication channel.
           (setq org-conf-plist
                 (org-combine-plists
@@ -1570,12 +1667,12 @@ first; see `org-conf-create-page-and-export'."
                         'org-conf-html subtreep visible-only body-only org-conf-plist))
           ;; Update the page!
           (setq ver-msg (read-string "Version message: "))
-          (org-conf-rest-put conf-id title conf-space output version ver-msg))
+          (org-conf-backend-update-page conf-id title conf-space output version ver-msg))
       (org-conf-create-page-and-export))))
 
 (defun org-conf-export-to-conf-without-post
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export to Confluence by calling `org-conf-rest-put function."
+  "Export to Confluence through the active backend."
   (interactive)
   ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
   ;; So put it above exporting.
@@ -1591,8 +1688,8 @@ first; see `org-conf-create-page-and-export'."
     (if conf-id
         (progn
           ;; Update page version number.
-          (setq res (org-conf-rest-get-page-json conf-id))
-          (setq version (1+ (cdr (assoc 'number (assoc 'version res)))))
+          (setq res (org-conf-backend-get-page-info conf-id))
+          (setq version (1+ (or (plist-get res :version) 0)))
           ;; Pass export parameters through communication channel.
           (setq org-conf-plist
                 (org-combine-plists
@@ -1604,7 +1701,7 @@ first; see `org-conf-create-page-and-export'."
                         'org-conf-html subtreep visible-only body-only org-conf-plist))
           ;; Update the page!
           (setq ver-msg (read-string "Version message: "))
-          (org-conf-rest-put conf-id title conf-space output version ver-msg))
+          (org-conf-backend-update-page conf-id title conf-space output version ver-msg))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-to-buffer
