@@ -1,0 +1,155 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project overview
+
+`ox-conf.el` is an Org Mode export backend that translates Org documents to Confluence Wiki Storage Format (XHTML with `ac:` macros). It is derived from the built-in `ox-html` backend and adds Confluence REST API integration to update existing Confluence pages on export.
+
+## How to use
+
+Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.org` file with `#+CONF_ID`, `#+CONF_SPACE`, and `#+CONF_PAGE` set at the top:
+
+- `M-x org-export-dispatch` → `f` opens the Confluence export menu:
+  - `f b` — export to a preview buffer
+  - `f p` — fetch page info (title, version) from Confluence and print it
+  - `f i` — list image attachments on the target Confluence page
+  - `f f` — full export: transcode the Org buffer and PUT it to Confluence (uploads images via POST). **If the buffer has no `#+CONF_ID`, it creates the page first** — see below.
+  - `f w` — export and PUT without uploading images
+  - `f r` — clear cached Confluence auth credentials (calls `auth-source-forget-all-cached`)
+  - `f o` — open the Confluence page in the browser (new in 2026-05)
+
+### Creating a page from scratch (2026-10-10)
+
+`f f` branches on whether the buffer has a `#+CONF_ID` (`org-conf--export-action`).
+With no id it runs `org-conf-create-page-and-export`, which asks for the target
+space, the page title (defaulting to `#+TITLE:`, then the file name) and a parent
+page, POSTs an empty page, writes `#+CONF_SPACE:`/`#+CONF_PAGE:`/`#+CONF_ID:` into
+the buffer (unsaved — you keep control), and then calls the normal
+`org-conf-export-to-conf` flow, so Confluence ends up with version 2 holding the
+real content.
+
+The `#+CONF_*` keywords are placed by `org-conf--insert-conf-keywords` at the end of
+the file's leading keyword block, found with `org-conf--keyword-block-end` (org's
+`org-at-keyword-p`). They therefore land *after* `#+TITLE:`/`#+OPTIONS:` rather than
+above them; existing CONF lines are removed first, so a file written by the older
+code gets normalised too. Note that ox reads these only as `#+` keywords —
+`org-export--get-inbuffer-options` ignores property drawers entirely, so
+`org-set-property` is not an option here.
+
+Parent pages are chosen by *title*, never by URL, and there are two modes:
+
+- `org-conf-root-parent-page` set: a flat, most-used-first list of that page's
+  descendants, built by BFS over `/rest/api/content/{id}/child/page` and labelled
+  `Root / Mid / Leaf` (`org-conf--collect-descendants`, `org-conf--parent-choices`).
+- unset: walk the space's tree one level at a time
+  (`org-conf--read-parent-by-drill-down`). Top-level pages come from
+  `/rest/api/space/{key}/content?depth=root` via `org-conf-rest-get-space-roots`.
+  Each menu leads with "use the current page", then "go up", then the children to
+  descend into; `org-conf--drill-choices` builds it.
+
+Both modes append a "type a URL/ID" escape hatch. Usage counts live in
+`org-conf-parent-freq-file`. Choices whose labels collide (same-titled siblings, or
+same-path pages) get an `[id]` suffix from `org-conf--unique-labels`, otherwise
+`completing-read` would return one string for two entries. Relevant options:
+`org-conf-root-parent-page`, `org-conf-parent-freq-file`, `org-conf-parent-max-pages`,
+`org-conf-parent-child-page-limit`, `org-conf-parent-root-label`,
+`org-conf-manual-parent-label`.
+
+## Tests
+
+```sh
+emacs -Q --batch -L test -l test/run-tests.el
+```
+
+`test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
+the ERT suite in `test/ox-conf-test.el`. The suite covers the pure helpers — path
+building, frequency sorting/persistence, JSON parsing, the POST payload, BFS
+collection, keyword placement, the drill-down decision table and the `f f` routing
+decision. `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down`
+and `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
+HTTP boundaries; the drill-down stubs also assert which menus were shown.
+
+The REST wrappers themselves (`org-conf-rest-*`, `org-conf--rest-get-json`) are not
+unit-tested — they are real HTTP. `org-conf--fetch-all-pages` is tested separately
+with an injected `get-json`, so the pagination logic is covered even though the
+wrapper is not.
+
+## Architecture
+
+The entire backend lives in a single file. Its structure:
+
+### 1. User-visible options (`defcustom`)
+- `org-conf-url` — Confluence host base URL
+- `org-conf-jira-chart-server` / `org-conf-jira-chart-server-id` — Jira integration for chart macros
+- `org-conf-default-space` — fallback Confluence space key
+- `org-conf-toc-headline` — heading text for the generated TOC (defaults to Chinese "目录")
+- `org-conf-log-level` — controls request logging verbosity (`-1` = silent)
+- `org-conf-root-parent-page` — page (URL or id) whose descendants are offered as parent-page choices when creating
+- `org-conf-parent-freq-file` — where parent-page usage counts are persisted
+- `org-conf-parent-max-pages` — cap on pages fetched while listing parent-page choices
+- `org-conf-parent-child-page-limit` — page size when walking `/child/page`
+- `org-conf-parent-root-label` — the display string for the "no parent page" choice
+- `org-conf-manual-parent-label` — the display string for the "type a URL/ID" escape hatch
+
+### 2. Template layer
+`org-conf-template` (outer wrapper), `org-conf-inner-template` (prepends TOC, appends footnotes), `org-conf-headline` (wraps in `numberedheadings` macro when `#+OPTIONS: num:t`), `org-conf-toc` (generates `ac:toc` macro), and `org-conf--tags` (maps Chinese tags to Confluence status macros colored Green/Yellow/Red/Blue).
+
+### 3. Element transcoders
+Override specific elements from `ox-html`. The most complex is `org-conf-special-block`, which dispatches on block type:
+- `warning`, `note`, `tip`, `expand`, `info` → Confluence panel macros
+- `history` → `change-history` macro
+- `section` → `section` macro with `:border` parameter (yes/no)
+- `column` → `column` macro with `:width` parameter
+- Any unknown type falls through, returning contents unchanged
+
+`org-conf-src-block` has three paths: Jira issue queries (`jira` language), Jira charts (`jirachart-pie` / `jirachart-2d`), and standard code blocks (maps Org src languages to Confluence code macro language IDs; special-cases `asm` → `c`, `rs` → `bash` with a host/path prompt comment).
+
+### 4. Filters (`:filters-alist`)
+- `org-conf-latex-fragment-filter` — wraps inline LaTeX in `mathinline` macro
+- `org-conf-latex-environment-filter` — wraps display LaTeX in `mathblock` macro
+- `org-conf-export-block-filter` — wraps raw HTML export blocks in an `html` macro with CDATA
+
+### 5. REST API layer (synchronous, uses the `request` library)
+- `org-conf-rest-get-page-json` — GET page metadata (version number for optimistic concurrency)
+- `org-conf-rest-put` — PUT updated page content as JSON (body in storage format)
+- `org-conf-rest-get-attach-json` — GET attachment list (parsed as plist)
+- `org-conf-rest-post-file` — POST new attachments or update existing ones (`X-Atlassian-Token: no-check` header)
+- `org-conf--rest-get-json` — generic authenticated GET returning parsed JSON (or nil on failure)
+- `org-conf-rest-get-page-node` — GET a page's `(:id :title)`
+- `org-conf-rest-get-children` — GET a page's direct children, paginating via `_links.next`
+- `org-conf-rest-get-space-roots` — GET a space's top-level pages (`depth=root`), same pagination
+- `org-conf-rest-post-page` — POST a new (empty) page under an optional parent, returning `(:id :webui)`
+
+`org-conf--fetch-all-pages` is the shared paginator behind both listings: it walks
+`_links.next` up to `org-conf--max-child-page-requests` requests and flattens
+`results` into `(:id :title)` plists. The API paths themselves are built by the pure
+`org-conf--child-page-api` and `org-conf--space-root-page-api`.
+
+Authentication uses HTTP Basic Auth through Emacs' `auth-source`, which caches credentials. `org-conf-forget-password` clears the cache.
+
+### 6. Export backend registration
+`org-export-define-derived-backend` at the end of the file defines `org-conf-html` as derived from `html`, with the `:translate-alist`, `:filters-alist`, `:options-alist`, and `:menu-entry` that tie everything together.
+
+## Org file requirements
+
+Every `.org` file to be exported must include:
+```
+#+CONF_SPACE: <space-key>
+#+CONF_PAGE: <full-confluence-page-url>
+#+CONF_ID: <page-id>
+```
+Use `M-x ske-conf` for a quick interactive template that prompts for space and page URL and auto-extracts the ID.
+
+## Edge cases and gotchas
+
+- **Example blocks are intentionally deprecated** (2025-11-17) — they emit a warning and produce empty content when exported. Use `#+begin_src` instead.
+- **`org-conf--embed-svg`** references an undefined `fun` variable (line 673 in the `.bak` file) — this appears to be a latent bug where the non-SVG fallback would break.
+- **Image uploads**: When doing `f f` (full export), images are uploaded via POST before the page content is PUT. If an image already exists on the server, the user is prompted interactively (`y-or-n-p`) to confirm replacement.
+- **Version management**: The export reads the current version number from Confluence, increments it by 1, and sends it with the PUT request. This implements optimistic concurrency — two simultaneous exports may conflict.
+- **Babel code template**: `org-babel-exp-code-template` is modified at the top level to pass Jira-specific parameters (`host`, `path`, `limit`, `columns`, `chart-type`, etc.) through to the src block transcoder.
+
+## CI/CD
+
+- `.github/workflows/opencode.yml` — triggers on issue/PR comments containing `/oc` or `/opencode`; runs an AI agent for code review
+- `.github/workflows/summary.yml` — uses `actions/ai-inference@v1` to auto-summarize new issues and post a comment

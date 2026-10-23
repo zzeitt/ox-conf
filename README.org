@@ -95,22 +95,33 @@ This is an org export backend that supports Confluence wiki storage format...
 
 Prerequisites:
   - Confluene page:
-    - Create one conf page on your Confluence cloud side. (Currently
-      ox-conf.el doesn't support creating the page from scratch,
-      instead it updates an existing page when exporting.)
+    - Nothing to prepare by hand: pressing ~f f~ on an org file that
+      has no ~#+CONF_ID~ creates the page for you.
   - Org file:
     - Add ~#+CONF_ID~ and ~#+CONF_SPACE~ at the top of the .org file
-      you want to export.
+      you want to export, or let ~f f~ create the page and write them
+      for you.
   - Emacs init:
     - Install =ox-conf.el=...
     - Specify ~org-conf-url~ according to your host URL in your init file (e.g. =init.el=).
     - Specify ~org-conf-jira-chart-server~ according to your case.
       - Ref: https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html
     - Specify ~org-conf-jria-chart-server-id~ according to your case.
+    - Optionally specify ~org-conf-root-parent-page~ (a page URL or
+      id): when set, parent pages are picked from that page's
+      descendants.  When it is left empty, you walk the space's page
+      tree one level at a time instead.  Either way candidates are
+      listed by page title, most-used first, and a URL can still be
+      typed by hand.
 
 Exporting:
   - Wake up org-export dispatch.
   - Press ~f f~ for exporting to the CONF_PAGE you provided.
+  - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
+    title, lets you settle on a parent page, creates the page, writes
+    ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
+    matter (after ~#+TITLE:~, never above it), and then uploads the
+    content in one go.
 
 Options:
   - ~f b~: "To buffer" org-conf-export-to-buffer
@@ -144,6 +155,18 @@ Change Log:
   - 2025-11-17: Deprecated 'example-block'.
   - 2025-11-27: Added 'footnote' support.
   - 2026-05-21: Added 'f o' dispatch action to open conf page.
+  - 2026-10-10: 'f f' now creates a Confluence page when the buffer has
+                no #+CONF_ID: it asks for space/title/parent page,
+                POSTs the page, writes the #+CONF_* keywords back, and
+                then runs the normal export.  Parent pages are picked
+                from the descendants of ~org-conf-root-parent-page~,
+                ordered by how often they were chosen before.
+  - 2026-10-10: Parent pages are offered by title rather than URL.
+                With no ~org-conf-root-parent-page~, walk the space's
+                tree one level at a time (top-level pages come from
+                /rest/api/space/{key}/content?depth=root).  The
+                CONF_* keywords now join the file's front matter after
+                #+TITLE: instead of being pushed above it.
 
 * Example
 Given this file: =tmp.org=.
