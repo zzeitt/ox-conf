@@ -475,6 +475,61 @@
                        (org-conf-backend-list-attachments "7")))))))
 
 ;;; ----------------------------------------------------------------------
+;;; The CLI process layer: arguments, JSON, errors, temp bodies.
+;;; ----------------------------------------------------------------------
+
+(ert-deftest ox-conf-test-cli-json-prefixes-json-and-parses ()
+  (let ((captured nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_program) "/usr/bin/confluence"))
+              ((symbol-function 'call-process)
+               (lambda (_program _infile dest _display &rest args)
+                 (setq captured args)
+                 (with-current-buffer (if (consp dest) (car dest) dest)
+                   (insert "{\"id\": \"7\", \"title\": \"Doc\"}"))
+                 0)))
+      (should (equal '((id . "7") (title . "Doc"))
+                     (org-conf--cli-json "info" "7")))
+      (should (equal '("--json" "info" "7") captured)))))
+
+(ert-deftest ox-conf-test-cli-json-reports-a-structured-error ()
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_program) "/usr/bin/confluence"))
+            ((symbol-function 'call-process)
+             (lambda (_program _infile dest _display &rest _)
+               (let ((stderr (nth 1 dest)))
+                 (when (stringp stderr)
+                   (with-temp-file stderr
+                     (insert "{\"error\":\"boom\",\"code\":\"API_ERROR\"}"))))
+               1)))
+    (let ((err (condition-case e
+                   (progn (org-conf--cli-json "info" "7") nil)
+                 (user-error (error-message-string e)))))
+      (should (string-match-p "boom" err)))))
+
+(ert-deftest ox-conf-test-cli-json-rejects-invalid-json ()
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_program) "/usr/bin/confluence"))
+            ((symbol-function 'call-process)
+             (lambda (_program _infile dest _display &rest _)
+               (with-current-buffer (if (consp dest) (car dest) dest)
+                 (insert "not json"))
+               0)))
+    (should-error (org-conf--cli-json "info" "7") :type 'user-error)))
+
+(ert-deftest ox-conf-test-with-temp-body-writes-utf8-and-deletes ()
+  (let (path)
+    (org-conf--with-temp-body
+        "中文 body"
+      (lambda (file)
+        (setq path file)
+        (should (equal "中文 body"
+                       (with-temp-buffer
+                         (insert-file-contents file)
+                         (buffer-string))))))
+    (should-not (file-exists-p path))))
+
+;;; ----------------------------------------------------------------------
 ;;; org-conf--json-link: pull a rel out of a JSON _links object.
 ;;; ----------------------------------------------------------------------
 

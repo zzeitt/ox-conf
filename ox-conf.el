@@ -1431,6 +1431,77 @@ Keys: :id, :title, :version, :space, :parent-id and :url."
           (append (plist-get (org-conf-rest-get-attach-json page-id) :results)
                   nil)))
 
+;;; ======================================================================
+;;;                     confluence-cli Process Layer
+;;; ======================================================================
+(defun org-conf--cli-program ()
+  "Return the absolute path of `org-conf-cli-program'."
+  (or (executable-find org-conf-cli-program)
+      (user-error "Confluence CLI not found: %s (set `org-conf-cli-program')"
+                  org-conf-cli-program)))
+
+(defun org-conf--cli-error-message (stderr-file)
+  "Return the message in STDERR-FILE, preferring the CLI's JSON `error'."
+  (let ((text (when (file-readable-p stderr-file)
+                (with-temp-buffer
+                  (insert-file-contents stderr-file)
+                  (string-trim (buffer-string))))))
+    (if (string-empty-p (or text ""))
+        "no error output"
+      (or (ignore-errors
+            (alist-get 'error
+                       (json-parse-string text :object-type 'alist)))
+          text))))
+
+(defun org-conf--cli-json (&rest args)
+  "Run the confluence CLI with ARGS and return the parsed JSON.
+The global `--json' flag is prepended to ARGS.  Signals `user-error'
+when the CLI exits non-zero or prints something that is not JSON."
+  (let* ((coding-system-for-read 'utf-8-unix)
+         (coding-system-for-write 'utf-8-unix)
+         (program (org-conf--cli-program))
+         (stderr (make-temp-file "ox-conf-cli-err-"))
+         status output)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (setq status (apply #'call-process program nil
+                                (list (current-buffer) stderr) nil
+                                "--json" args))
+            (setq output (buffer-string)))
+          (unless (and (integerp status) (zerop status))
+            (user-error "confluence %s failed: %s"
+                        (mapconcat #'identity args " ")
+                        (org-conf--cli-error-message stderr)))
+          (condition-case err
+              (with-temp-buffer
+                (insert output)
+                (goto-char (point-min))
+                (json-parse-buffer :object-type 'alist
+                                   :array-type 'list
+                                   :null-object nil
+                                   :false-object nil))
+            (error
+             (user-error "confluence %s returned invalid JSON: %s"
+                         (mapconcat #'identity args " ")
+                         (error-message-string err)))))
+      (delete-file stderr))))
+
+(defun org-conf--write-utf8-file (text)
+  "Write TEXT to a fresh UTF-8 temporary file and return its name."
+  (let ((file (make-temp-file "ox-conf-body-" nil ".html"))
+        (coding-system-for-write 'utf-8-unix))
+    (with-temp-file file
+      (insert text))
+    file))
+
+(defun org-conf--with-temp-body (text fn)
+  "Call FN with a temporary UTF-8 file holding TEXT, then delete it."
+  (let ((file (org-conf--write-utf8-file text)))
+    (unwind-protect
+        (funcall fn file)
+      (delete-file file))))
+
 (defun org-conf--upload-img (conf-id link)
   "Given image file or attachment's path LINK, upload it to conf page with CONF-ID.
 Ask for confirmation when an attachment with the same name exists."
