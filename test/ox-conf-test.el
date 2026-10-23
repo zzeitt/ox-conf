@@ -130,6 +130,28 @@
   (should (null (org-conf--parse-child-page-json '((results . [])))))
   (should (null (org-conf--parse-child-page-json '()))))
 
+(ert-deftest ox-conf-test-parse-space-root-json-reads-grouped-page-results ()
+  "The space-content endpoint groups results under a content-type key."
+  (let ((json '((page . ((results . [((id . "1") (title . "Root"))])))
+                (blogpost . ((results . []))))))
+    (should (equal '((:id "1" :title "Root"))
+                   (org-conf--parse-child-page-json json)))))
+
+(ert-deftest ox-conf-test-parse-space-root-json-handles-an-empty-page-group ()
+  (should (null (org-conf--parse-child-page-json '((page . ((results . []))))))))
+
+(ert-deftest ox-conf-test-fetch-all-pages-follows-a-grouped-next-link ()
+  (let* ((first '((page . ((results . [((id . "1") (title . "A"))])
+                           (_links . ((next . "/page/2")))))))
+         (second '((page . ((results . [((id . "2") (title . "B"))])))))
+         (calls nil)
+         (get-json (lambda (api)
+                     (push api calls)
+                     (if (equal api "/page/2") second first))))
+    (should (equal '((:id "1" :title "A") (:id "2" :title "B"))
+                   (org-conf--fetch-all-pages "/page/1" get-json)))
+    (should (equal '("/page/1" "/page/2") (nreverse calls)))))
+
 (ert-deftest ox-conf-test-parse-created-page-extracts-id-and-webui ()
   "A POST response becomes a plist with the new page's id and web path."
   (let ((json '((id . "123")

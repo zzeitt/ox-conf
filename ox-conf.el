@@ -934,7 +934,7 @@ nil when the request failed.  At most
         (requests 1))
     (while (and json (<= requests org-conf--max-child-page-requests))
       (setq pages (append pages (org-conf--parse-child-page-json json)))
-      (let ((next (org-conf--json-link json 'next)))
+      (let ((next (org-conf--page-json-next json)))
         (setq json (and next
                         (< requests org-conf--max-child-page-requests)
                         (funcall get-json next)))
@@ -949,14 +949,28 @@ nil when the request failed.  At most
   "Return SPACE's top-level pages as a list of (:id :title) plists."
   (org-conf--fetch-all-pages (org-conf--space-root-page-api space) get-json))
 
+(defun org-conf--page-json-results (json)
+  "Return the entry alists in JSON.
+Understands both the flat `results' shape used by /child/page and the
+grouped shape used by /space/{key}/content, where the entries live under
+a content-type key such as `page'."
+  (let ((results (or (assoc 'results json)
+                     (assoc 'results (cdr (assoc 'page json))))))
+    (append (cdr results) nil)))
+
+(defun org-conf--page-json-next (json)
+  "Return JSON's next-page link, from the flat or grouped shape."
+  (or (org-conf--json-link json 'next)
+      (org-conf--json-link (cdr (assoc 'page json)) 'next)))
+
 (defun org-conf--parse-child-page-json (json)
   "Turn a child/page JSON response into a list of (:id :title) plists.
-Missing or empty results yield nil."
-  (let ((results (cdr (assoc 'results json))))
-    (mapcar (lambda (entry)
-              (list :id (cdr (assoc 'id entry))
-                    :title (cdr (assoc 'title entry))))
-            (append results nil))))
+Missing or empty results yield nil.  Space-content responses, which group
+their entries under a content-type key, are unwrapped too."
+  (mapcar (lambda (entry)
+            (list :id (cdr (assoc 'id entry))
+                  :title (cdr (assoc 'title entry))))
+          (org-conf--page-json-results json)))
 
 (defun org-conf--parse-created-page (json)
   "Turn a POST /rest/api/content response into a (:id :webui) plist.
