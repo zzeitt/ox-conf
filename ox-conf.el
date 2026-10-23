@@ -152,11 +152,14 @@
   :group 'org-export-conf)
 
 (defun org-conf--return-api-url (api)
-  "Borrowed from org-jira/jiralib.el. Given a api path, return the
-full URL with properly concatenated slash '/'."
-  (concat (replace-regexp-in-string "/*$" "/" org-conf-url)
-          (replace-regexp-in-string "^/*" "" api))
-  )
+  "Return the full URL for API.
+API may be a host-relative path, which is joined to `org-conf-url', or
+an absolute URL (Confluence often puts those in `_links.next'), which
+passes through unchanged."
+  (if (string-match-p "\\`https?://" api)
+      api
+    (concat (replace-regexp-in-string "/*$" "/" org-conf-url)
+            (replace-regexp-in-string "^/*" "" api))))
 
 (defcustom org-conf-log-level -1
   "Logging level for request.
@@ -953,11 +956,15 @@ space."
   (format "/rest/api/space/%s/content?depth=root&limit=%s"
           space org-conf-parent-child-page-limit))
 
-(defun org-conf--fetch-all-pages (api get-json)
+(defun org-conf--fetch-all-pages (api get-json &optional next-fn)
   "Return every (:id :title) reachable from API, following `next' links.
 GET-JSON is called with an API path and must return the parsed JSON, or
 nil when the request failed.  At most
-`org-conf--max-child-page-requests' requests are issued."
+`org-conf--max-child-page-requests' requests are issued.
+
+NEXT-FN, when non-nil, is called with the original API path and the
+next link to produce the next request path; space-root listings use it
+to keep `depth=root' on page two."
   (let ((json (funcall get-json api))
         (pages nil)
         (requests 1))
@@ -966,7 +973,10 @@ nil when the request failed.  At most
       (let ((next (org-conf--page-json-next json)))
         (setq json (and next
                         (< requests org-conf--max-child-page-requests)
-                        (funcall get-json next)))
+                        (funcall get-json
+                                 (if next-fn
+                                     (funcall next-fn api next)
+                                   next))))
         (when json (setq requests (1+ requests)))))
     pages))
 
@@ -976,7 +986,8 @@ nil when the request failed.  At most
 
 (defun org-conf--fetch-all-space-roots (space get-json)
   "Return SPACE's top-level pages as a list of (:id :title) plists."
-  (org-conf--fetch-all-pages (org-conf--space-root-page-api space) get-json))
+  (org-conf--fetch-all-pages (org-conf--space-root-page-api space) get-json
+                             #'org-conf--space-root-next))
 
 (defun org-conf--page-json-results (json)
   "Return the entry alists in JSON.
@@ -991,6 +1002,22 @@ a content-type key such as `page'."
   "Return JSON's next-page link, from the flat or grouped shape."
   (or (org-conf--json-link json 'next)
       (org-conf--json-link (cdr (assoc 'page json)) 'next)))
+
+(defun org-conf--query-param (url name)
+  "Return NAME's value from URL's query string, or nil."
+  (when (string-match (format "[?&]%s=\\([^&]*\\)" (regexp-quote name)) url)
+    (match-string 1 url)))
+
+(defun org-conf--space-root-next (api next)
+  "Return the next space-root request after NEXT.
+Confluence's grouped next link points at the per-type endpoint
+\(/space/{key}/content/page), which drops `depth=root' and re-enumerates
+the whole content type.  Rebuild the request from API with NEXT's
+`start' offset so the listing stays root-only."
+  (let ((start (and next (org-conf--query-param next "start"))))
+    (if start
+        (format "%s%cstart=%s" api (if (string-match-p "?" api) ?& ??) start)
+      next)))
 
 (defun org-conf--parse-child-page-json (json)
   "Turn a child/page JSON response into a list of (:id :title) plists.
@@ -1560,13 +1587,14 @@ transport without redefining `org-conf--cli-json'.")
 
 (defun org-conf-cli-get-space-roots (space)
   "Return SPACE's top-level pages as (:id :title) plists."
-  (let ((api (org-conf--cli-api-path (org-conf--space-root-page-api space)))
-        (pages nil)
-        (requests 0))
+  (let* ((base (org-conf--cli-api-path (org-conf--space-root-page-api space)))
+         (api base)
+         (pages nil)
+         (requests 0))
     (while (and api (< requests org-conf--max-child-page-requests))
       (let ((json (org-conf--cli-invoke "api" api)))
         (setq pages (append pages (org-conf--parse-child-page-json json)))
-        (setq api (org-conf--page-json-next json))
+        (setq api (org-conf--space-root-next base (org-conf--page-json-next json)))
         (setq requests (1+ requests))))
     pages))
 
@@ -1715,12 +1743,22 @@ Return nil when the answer is blank, meaning the space root."
       (or (org-conf--return-id-from-url typed)
           (user-error "No page id found in %s" typed)))))
 
+(defun org-conf--read-or-nil (function &rest args)
+  "Call FUNCTION with ARGS, returning nil and messaging on backend failure.
+Only `user-error' is caught: the REST backend already returns nil on a
+failed read, while the CLI backend raises."
+  (condition-case err
+      (apply function args)
+    (user-error
+     (message "%s" (error-message-string err))
+     nil)))
+
 (defun org-conf--space-roots-or-warn (space)
   "Return SPACE's top-level pages, warning when the listing came back empty.
 An empty list means either an empty space or that this Confluence
 rejected `depth=root'; either way the user needs to be told rather than
 shown a menu with nothing in it."
-  (let ((roots (org-conf-backend-get-space-roots space)))
+  (let ((roots (org-conf--read-or-nil #'org-conf-backend-get-space-roots space)))
     (unless roots
       (message "Space %s listed no top-level pages; type a page URL instead."
                space))
@@ -1736,7 +1774,9 @@ nil when the user settles on the space root itself."
         (answer 'pending))
     (while (eq answer 'pending)
       (let* ((children (if current
-                           (org-conf-backend-get-children (plist-get current :id))
+                           (org-conf--read-or-nil
+                            #'org-conf-backend-get-children
+                            (plist-get current :id))
                          (org-conf--space-roots-or-warn space)))
              (choices (org-conf--drill-choices current children))
              (action (cdr (assoc (completing-read "Parent page: " choices nil t)
@@ -1767,15 +1807,18 @@ a URL can still be typed by hand."
                root)
       (org-conf--read-parent-id-manually))
      (t
-      (let ((node (org-conf-backend-get-page-info
-                   (org-conf--return-id-from-url root))))
+      (let* ((id (org-conf--return-id-from-url root))
+             (node (org-conf--read-or-nil #'org-conf-backend-get-page-info id)))
         (if (not (plist-get node :title))
             (progn
               (message "Cannot read Confluence page %s; asking for a parent page instead."
-                       (plist-get node :id))
+                       id)
               (org-conf--read-parent-id-manually))
           (let* ((candidates (org-conf--collect-descendants
-                              node #'org-conf-backend-get-children
+                              node
+                              (lambda (page-id)
+                                (org-conf--read-or-nil
+                                 #'org-conf-backend-get-children page-id))
                               org-conf-parent-max-pages))
                  (sorted (org-conf--sort-parent-candidates
                           candidates

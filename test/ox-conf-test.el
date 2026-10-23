@@ -428,6 +428,12 @@
     (should (equal "https://other.example.com/pages/1"
                    (org-conf--page-url "https://other.example.com/pages/1")))))
 
+(ert-deftest ox-conf-test-return-api-url-passes-an-absolute-url-through ()
+  (let ((org-conf-url "http://wiki.example.com/"))
+    (should (equal "https://other.example.com/rest/api/content/1/child/page?start=1"
+                   (org-conf--return-api-url
+                    "https://other.example.com/rest/api/content/1/child/page?start=1")))))
+
 ;;; ----------------------------------------------------------------------
 ;;; Backend selection and the REST adapter.
 ;;; ----------------------------------------------------------------------
@@ -587,6 +593,23 @@
                        "https://x/next")
                      (nreverse calls))))))
 
+(ert-deftest ox-conf-test-cli-get-space-roots-rewrites-a-per-type-next-link ()
+  "The CLI must not re-enumerate the whole content type on page two."
+  (let ((calls nil)
+        (org-conf-parent-child-page-limit 1))
+    (cl-letf (((symbol-value 'org-conf--cli-json-function)
+               (lambda (&rest args)
+                 (push (cadr args) calls)
+                 (if (equal (cadr args) "space/DOCS/content?depth=root&limit=1")
+                     '((page . ((results . [((id . "1") (title . "Root"))])
+                                (_links . ((next . "/rest/api/space/DOCS/content/page?limit=1&start=1"))))))
+                   '((page . ((results . [((id . "2") (title . "Other"))]))))))))
+      (should (equal '((:id "1" :title "Root") (:id "2" :title "Other"))
+                     (org-conf-cli-get-space-roots "DOCS")))
+      (should (equal '("space/DOCS/content?depth=root&limit=1"
+                       "space/DOCS/content?depth=root&limit=1&start=1")
+                     (nreverse calls))))))
+
 (ert-deftest ox-conf-test-cli-create-page-uses-create-child-and-a-body-file ()
   (let (captured)
     (cl-letf (((symbol-value 'org-conf--cli-json-function)
@@ -714,6 +737,33 @@
     (org-conf--fetch-all-space-roots "DOCS" get-json)
     (should (equal '("/rest/api/space/DOCS/content?depth=root&limit=200")
                    calls))))
+
+(ert-deftest ox-conf-test-space-root-next-rewrites-a-per-type-next-link ()
+  "The grouped next link drops depth=root; restore it with the next start."
+  (should (equal "/rest/api/space/DOCS/content?depth=root&limit=1&start=1"
+                 (org-conf--space-root-next
+                  "/rest/api/space/DOCS/content?depth=root&limit=1"
+                  "/rest/api/space/DOCS/content/page?limit=1&start=1"))))
+
+(ert-deftest ox-conf-test-space-root-next-keeps-a-link-without-start ()
+  (should (equal "/next" (org-conf--space-root-next "/api" "/next"))))
+
+(ert-deftest ox-conf-test-fetch-all-space-roots-rewrites-a-grouped-next-link ()
+  "A per-type next link must not re-enumerate the whole content type."
+  (let* ((calls nil)
+         (org-conf-parent-child-page-limit 1)
+         (first '((page . ((results . [((id . "1") (title . "Root"))])
+                           (_links . ((next . "/rest/api/space/DOCS/content/page?limit=1&start=1")))))))
+         (second '((page . ((results . [((id . "2") (title . "Other"))])))))
+         (get-json (lambda (api)
+                     (push api calls)
+                     (if (equal api "/rest/api/space/DOCS/content?depth=root&limit=1&start=1")
+                         second first))))
+    (should (equal '((:id "1" :title "Root") (:id "2" :title "Other"))
+                   (org-conf--fetch-all-space-roots "DOCS" get-json)))
+    (should (equal '("/rest/api/space/DOCS/content?depth=root&limit=1"
+                     "/rest/api/space/DOCS/content?depth=root&limit=1&start=1")
+                   (nreverse calls)))))
 
 ;;; ----------------------------------------------------------------------
 ;;; org-conf-create-page-and-export: the whole "f f" wiring.
@@ -945,6 +995,24 @@ list of menus that were shown, in order.  The getter is repeatable."
                (lambda (_space) '((:id "1" :title "Alpha")))))
       (should (equal "777" (org-conf--read-parent-by-drill-down "DOCS"))))))
 
+(ert-deftest ox-conf-test-drill-down-survives-a-failing-space-root-listing ()
+  (let ((stub (ox-conf-test--drill-stub '("（手动输入页面 URL/ID）"))))
+    (cl-letf (((symbol-function 'completing-read) (car stub))
+              ((symbol-function 'read-string) (lambda (&rest _) ""))
+              ((symbol-function 'org-conf-backend-get-space-roots)
+               (lambda (_space) (user-error "backend down"))))
+      (should (null (org-conf--read-parent-by-drill-down "DOCS"))))))
+
+(ert-deftest ox-conf-test-drill-down-survives-a-failing-child-listing ()
+  (let ((stub (ox-conf-test--drill-stub
+               '("Alpha" "✓ 就用「Alpha」作为父页面"))))
+    (cl-letf (((symbol-function 'completing-read) (car stub))
+              ((symbol-function 'org-conf-backend-get-space-roots)
+               (lambda (_space) '((:id "1" :title "Alpha"))))
+              ((symbol-function 'org-conf-backend-get-children)
+               (lambda (_id) (user-error "children down"))))
+      (should (equal "1" (org-conf--read-parent-by-drill-down "DOCS"))))))
+
 ;;; ----------------------------------------------------------------------
 ;;; org-conf--read-parent-id: which source of parent pages is used.
 ;;; ----------------------------------------------------------------------
@@ -977,6 +1045,20 @@ list of menus that were shown, in order.  The getter is repeatable."
           (should (equal "777" (org-conf--read-parent-id "DOCS")))
           (should (member "（手动输入页面 URL/ID）" menus))
           (should (member "（建在 space 根目录）" menus)))
+      (delete-file org-conf-parent-freq-file))))
+
+(ert-deftest ox-conf-test-read-parent-id-falls-back-when-the-root-cannot-be-read ()
+  "A CLI read failure must not abort the create flow."
+  (let ((org-conf-root-parent-page "999")
+        (org-conf-parent-freq-file (make-temp-file "ox-conf-freq" nil ".eld"))
+        (manual nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                   (lambda (_id) (user-error "backend down")))
+                  ((symbol-function 'org-conf--read-parent-id-manually)
+                   (lambda () (setq manual t) "777")))
+          (should (equal "777" (org-conf--read-parent-id "DOCS")))
+          (should manual))
       (delete-file org-conf-parent-freq-file))))
 
 ;;; ox-conf-test.el ends here
