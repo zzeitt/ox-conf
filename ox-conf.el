@@ -44,6 +44,15 @@
 ;;       tree one level at a time instead.  Either way candidates are
 ;;       listed by page title, most-used first, and a URL can still be
 ;;       typed by hand.
+;;     - Choose the transport with ~org-conf-backend~:
+;;         - ~auto~ (default): use the =confluence= CLI when
+;;           ~org-conf-cli-program~ is on ~exec-path~, otherwise the
+;;           REST API;
+;;         - ~rest~: always use the REST API (auth via ~auth-source~);
+;;         - ~cli~: always use the =confluence= CLI, which needs a
+;;           configured profile (see ~confluence profile list~).
+;;       The CLI does not use Emacs credentials, and ~f r~ only clears
+;;       the REST auth cache.
 ;;
 ;; Exporting:
 ;;   - Wake up org-export dispatch.
@@ -51,8 +60,8 @@
 ;;   - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
 ;;     title, lets you settle on a parent page, creates the page, writes
 ;;     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
-;;     matter (after ~#+TITLE:~, never above it), and then uploads the
-;;     content in one go.
+;;     matter (after the leading #+ keywords, never above a shebang or
+;;     mode line), and then uploads the content in one go.
 ;;
 ;; Options:
 ;;   - ~f b~: "To buffer" org-conf-export-to-buffer
@@ -60,7 +69,8 @@
 ;;   - ~f i~: "Image info" org-conf-export-img-info
 ;;   - ~f f~: "To Confluence" org-conf-export-to-conf
 ;;   - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
-;;   - ~f r~: "Forget the wrong password" org-conf-forget-password
+;;   - ~f r~: "Forget the wrong password" (REST auth cache only)
+;;            org-conf-forget-password
 ;;
 ;; Response:
 ;;   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
@@ -98,6 +108,11 @@
 ;;                 /rest/api/space/{key}/content?depth=root).  The
 ;;                 CONF_* keywords now join the file's front matter after
 ;;                 #+TITLE: instead of being pushed above it.
+;;   - 2026-10-24: Fixed parent-page listing: the space-content endpoint
+;;                 groups results by content type, so `page.results' is
+;;                 now unwrapped and paginated.  CONF_* stays below a
+;;                 leading shebang / mode line.  Added the =confluence=
+;;                 CLI backend behind ~org-conf-backend~ (auto/rest/cli).
 
 
 ;;; Code:
@@ -1878,11 +1893,14 @@ first; see `org-conf-create-page-and-export'."
 
 (defun org-conf-forget-password
     (&optional async subtreep visible-only body-only ext-plist)
-  "Don't worry, let's retry the password... and forget the old one."
+  "Don't worry, let's retry the password... and forget the old one.
+This only affects the REST backend; the CLI manages its own credentials."
   (interactive)
   (auth-source-forget-all-cached)
-  (message "Password cache has been forgotten!")
-  )
+  (message "Password cache has been forgotten!%s"
+           (if (eq (org-conf--active-backend) 'cli)
+               " The CLI backend manages its own credentials; see `confluence profile list'."
+             "")))
 
 (defun org-conf-open-page
     (&optional async subtreep visible-only body-only ext-plist)

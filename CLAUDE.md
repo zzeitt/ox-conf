@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-`ox-conf.el` is an Org Mode export backend that translates Org documents to Confluence Wiki Storage Format (XHTML with `ac:` macros). It is derived from the built-in `ox-html` backend and adds Confluence REST API integration to update existing Confluence pages on export.
+`ox-conf.el` is an Org Mode export backend that translates Org documents to Confluence Wiki Storage Format (XHTML with `ac:` macros). It is derived from the built-in `ox-html` backend and adds Confluence integration (REST API or the `confluence` CLI) to update existing Confluence pages on export.
 
 ## How to use
 
@@ -16,8 +16,25 @@ Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.o
   - `f i` — list image attachments on the target Confluence page
   - `f f` — full export: transcode the Org buffer and PUT it to Confluence (uploads images via POST). **If the buffer has no `#+CONF_ID`, it creates the page first** — see below.
   - `f w` — export and PUT without uploading images
-  - `f r` — clear cached Confluence auth credentials (calls `auth-source-forget-all-cached`)
+  - `f r` — clear cached Confluence REST credentials (calls `auth-source-forget-all-cached`); the CLI backend manages its own credentials
   - `f o` — open the Confluence page in the browser (new in 2026-05)
+
+### Backends (2026-10-24)
+
+`org-conf-backend` selects the transport:
+
+- `auto` (default) — use the `confluence` CLI when `org-conf-cli-program`
+  (`"confluence"` by default) is found on `exec-path`, otherwise REST.
+- `rest` — always use the REST API (credentials via `auth-source`).
+- `cli` — always use the `confluence` CLI; it needs a configured profile
+  (`confluence profile list`).
+
+The export flow calls seven dispatchers (`org-conf-backend-get-page-info`,
+`-get-children`, `-get-space-roots`, `-create-page`, `-update-page`,
+`-list-attachments`, `-upload-attachment`), resolved through
+`org-conf--backend-functions`. The CLI path runs `confluence --json …` via
+`call-process`, sends page bodies through a temporary UTF-8 `--file`, and never
+uses Emacs credentials.
 
 ### Creating a page from scratch (2026-10-10)
 
@@ -33,9 +50,11 @@ The `#+CONF_*` keywords are placed by `org-conf--insert-conf-keywords` at the en
 the file's leading keyword block, found with `org-conf--keyword-block-end` (org's
 `org-at-keyword-p`). They therefore land *after* `#+TITLE:`/`#+OPTIONS:` rather than
 above them; existing CONF lines are removed first, so a file written by the older
-code gets normalised too. Note that ox reads these only as `#+` keywords —
-`org-export--get-inbuffer-options` ignores property drawers entirely, so
-`org-set-property` is not an option here.
+code gets normalised too. Leading blank lines, a shebang, an Emacs mode line
+(`# -*- … -*-`) and org comments are skipped first by
+`org-conf--front-matter-start`, so the block is never pushed above them. Note that
+ox reads these only as `#+` keywords — `org-export--get-inbuffer-options` ignores
+property drawers entirely, so `org-set-property` is not an option here.
 
 Parent pages are chosen by *title*, never by URL, and there are two modes:
 
@@ -44,9 +63,15 @@ Parent pages are chosen by *title*, never by URL, and there are two modes:
   `Root / Mid / Leaf` (`org-conf--collect-descendants`, `org-conf--parent-choices`).
 - unset: walk the space's tree one level at a time
   (`org-conf--read-parent-by-drill-down`). Top-level pages come from
-  `/rest/api/space/{key}/content?depth=root` via `org-conf-rest-get-space-roots`.
+  `/rest/api/space/{key}/content?depth=root` via `org-conf-backend-get-space-roots`.
   Each menu leads with "use the current page", then "go up", then the children to
   descend into; `org-conf--drill-choices` builds it.
+
+The space-content endpoint groups its results by content type
+(`{"page": {"results": …}}`); `org-conf--page-json-results` and
+`org-conf--page-json-next` unwrap both that shape and the flat `/child/page`
+shape, so the top-level menu lists real pages instead of only the synthetic
+root/manual entries.
 
 Both modes append a "type a URL/ID" escape hatch. Usage counts live in
 `org-conf-parent-freq-file`. Choices whose labels collide (same-titled siblings, or
@@ -63,17 +88,21 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite in `test/ox-conf-test.el`. The suite covers the pure helpers — path
-building, frequency sorting/persistence, JSON parsing, the POST payload, BFS
-collection, keyword placement, the drill-down decision table and the `f f` routing
-decision. `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down`
-and `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
-HTTP boundaries; the drill-down stubs also assert which menus were shown.
+the ERT suite (94 tests) in `test/ox-conf-test.el`. The suite covers the pure
+helpers — path building, frequency sorting/persistence, grouped and flat JSON
+parsing, the POST payload, BFS collection, shebang-aware keyword placement, the
+drill-down decision table, the `f f` routing decision, backend selection and the
+REST adapters, and the CLI command lines and error handling.
+`org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
+`org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
+backend boundaries; the drill-down stubs also assert which menus were shown.
+CLI-operation tests rebind `org-conf--cli-json-function`, the transport seam.
 
 The REST wrappers themselves (`org-conf-rest-*`, `org-conf--rest-get-json`) are not
 unit-tested — they are real HTTP. `org-conf--fetch-all-pages` is tested separately
 with an injected `get-json`, so the pagination logic is covered even though the
-wrapper is not.
+wrapper is not. The CLI process layer is tested by stubbing `call-process`; real
+CLI/REST reads are exercised only by the read-only live check.
 
 ## Architecture
 
@@ -85,6 +114,8 @@ The entire backend lives in a single file. Its structure:
 - `org-conf-default-space` — fallback Confluence space key
 - `org-conf-toc-headline` — heading text for the generated TOC (defaults to Chinese "目录")
 - `org-conf-log-level` — controls request logging verbosity (`-1` = silent)
+- `org-conf-backend` — transport: `auto` (default), `rest`, or `cli`
+- `org-conf-cli-program` — executable used by the `cli` backend (default `"confluence"`)
 - `org-conf-root-parent-page` — page (URL or id) whose descendants are offered as parent-page choices when creating
 - `org-conf-parent-freq-file` — where parent-page usage counts are persisted
 - `org-conf-parent-max-pages` — cap on pages fetched while listing parent-page choices
@@ -110,8 +141,15 @@ Override specific elements from `ox-html`. The most complex is `org-conf-special
 - `org-conf-latex-environment-filter` — wraps display LaTeX in `mathblock` macro
 - `org-conf-export-block-filter` — wraps raw HTML export blocks in an `html` macro with CDATA
 
-### 5. REST API layer (synchronous, uses the `request` library)
-- `org-conf-rest-get-page-json` — GET page metadata (version number for optimistic concurrency)
+### 5. Backend layer: REST and confluence-cli
+
+The stable interface is seven dispatchers — `org-conf-backend-get-page-info`,
+`-get-children`, `-get-space-roots`, `-create-page`, `-update-page`,
+`-list-attachments`, `-upload-attachment` — resolved by
+`org-conf--active-backend` and the `org-conf--backend-functions` alist.
+
+REST implementation (synchronous, uses the `request` library):
+- `org-conf-rest-get-page-json` — GET page metadata (version, space, ancestors, links)
 - `org-conf-rest-put` — PUT updated page content as JSON (body in storage format)
 - `org-conf-rest-get-attach-json` — GET attachment list (parsed as plist)
 - `org-conf-rest-post-file` — POST new attachments or update existing ones (`X-Atlassian-Token: no-check` header)
@@ -120,13 +158,27 @@ Override specific elements from `ox-html`. The most complex is `org-conf-special
 - `org-conf-rest-get-children` — GET a page's direct children, paginating via `_links.next`
 - `org-conf-rest-get-space-roots` — GET a space's top-level pages (`depth=root`), same pagination
 - `org-conf-rest-post-page` — POST a new (empty) page under an optional parent, returning `(:id :webui)`
+- `org-conf-rest-get-page-info` / `org-conf-rest-list-attachments` — adapters that
+  normalize REST JSON into the dispatcher plists
 
-`org-conf--fetch-all-pages` is the shared paginator behind both listings: it walks
-`_links.next` up to `org-conf--max-child-page-requests` requests and flattens
-`results` into `(:id :title)` plists. The API paths themselves are built by the pure
-`org-conf--child-page-api` and `org-conf--space-root-page-api`.
+CLI implementation (`confluence` 2.29.0, `--json` output):
+- `org-conf--cli-json` — runs `confluence --json …` via `call-process`, captures
+  stderr in a temp file, and raises `user-error` on non-zero exit or invalid JSON
+- `org-conf--cli-invoke` — applies `org-conf--cli-json-function`, the rebindable
+  transport seam
+- `org-conf--with-temp-body` — writes UTF-8 page bodies to a temp file for `--file`
+- `org-conf-cli-get-page-info`, `-get-children`, `-get-space-roots`,
+  `-create-page`, `-update-page`, `-list-attachments`, `-upload-attachment`
 
-Authentication uses HTTP Basic Auth through Emacs' `auth-source`, which caches credentials. `org-conf-forget-password` clears the cache.
+`org-conf--fetch-all-pages` is the shared paginator behind both REST listings: it
+walks `_links.next` up to `org-conf--max-child-page-requests` requests and flattens
+`results` into `(:id :title)` plists. `org-conf--page-json-results` and
+`org-conf--page-json-next` handle both the flat `/child/page` shape and the grouped
+space-content shape. The API paths themselves are built by the pure
+`org-conf--child-page-api` and `org-conf--space-root-page-api`;
+`org-conf--cli-api-path` strips the REST prefix for the CLI's `api` command.
+
+REST authentication uses HTTP Basic Auth through Emacs' `auth-source`, which caches credentials. `org-conf-forget-password` clears that cache only; the CLI manages its own profile credentials.
 
 ### 6. Export backend registration
 `org-export-define-derived-backend` at the end of the file defines `org-conf-html` as derived from `html`, with the `:translate-alist`, `:filters-alist`, `:options-alist`, and `:menu-entry` that tie everything together.
