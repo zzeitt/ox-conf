@@ -61,11 +61,15 @@ Parent pages are chosen by *title*, never by URL, and there are two modes:
 - `org-conf-root-parent-page` set: a flat, most-used-first list of that page's
   descendants, built by BFS over `/rest/api/content/{id}/child/page` and labelled
   `Root / Mid / Leaf` (`org-conf--collect-descendants`, `org-conf--parent-choices`).
-- unset: walk the space's tree one level at a time
-  (`org-conf--read-parent-by-drill-down`). Top-level pages come from
+- unset: infer a scope with `org-conf--infer-parent-scope` — the common ancestor
+  of exported `.org` files in the current directory (or one/two levels up), then
+  the parent of the most-used page in `org-conf-parent-freq-file`, then a title
+  match on the directory name — and start `org-conf--read-parent-by-drill-down`
+  there. Menus are file-like: `..` goes to the parent page, direct children are
+  entered on selection, `✓ 就用 …` confirms the current page; frequently used
+  parents in the same space come first. `org-conf--drill-choices` builds it.
+  The space-top fallback lists the space roots from
   `/rest/api/space/{key}/content?depth=root` via `org-conf-backend-get-space-roots`.
-  Each menu leads with "use the current page", then "go up", then the children to
-  descend into; `org-conf--drill-choices` builds it.
 
 The space-content endpoint groups its results by content type
 (`{"page": {"results": …}}`); `org-conf--page-json-results` and
@@ -88,11 +92,13 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (94 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (117 tests) in `test/ox-conf-test.el`. The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement, the
-drill-down decision table, the `f f` routing decision, backend selection and the
-REST adapters, and the CLI command lines and error handling.
+drill-down decision table, backend selection and the REST adapters, the CLI
+command lines and error handling, parent-scope inference (common ancestor,
+sibling/recent/title-search fallbacks), recent-parent filtering, and the file-like
+menu (`..`, confirm, recent, children, manual).
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
 `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
 backend boundaries; the drill-down stubs also assert which menus were shown.
@@ -120,6 +126,8 @@ The entire backend lives in a single file. Its structure:
 - `org-conf-parent-freq-file` — where parent-page usage counts are persisted
 - `org-conf-parent-max-pages` — cap on pages fetched while listing parent-page choices
 - `org-conf-parent-child-page-limit` — page size when walking `/child/page`
+- `org-conf-scope-search-depth` — how many directory levels to climb when inferring the parent scope
+- `org-conf-recent-parent-limit` — how many frequently used parents to offer first
 - `org-conf-parent-root-label` — the display string for the "no parent page" choice
 - `org-conf-manual-parent-label` — the display string for the "type a URL/ID" escape hatch
 
@@ -143,9 +151,9 @@ Override specific elements from `ox-html`. The most complex is `org-conf-special
 
 ### 5. Backend layer: REST and confluence-cli
 
-The stable interface is seven dispatchers — `org-conf-backend-get-page-info`,
+The stable interface is eight dispatchers — `org-conf-backend-get-page-info`,
 `-get-children`, `-get-space-roots`, `-create-page`, `-update-page`,
-`-list-attachments`, `-upload-attachment` — resolved by
+`-list-attachments`, `-upload-attachment`, `-search-pages` — resolved by
 `org-conf--active-backend` and the `org-conf--backend-functions` alist.
 
 REST implementation (synchronous, uses the `request` library):
@@ -160,6 +168,7 @@ REST implementation (synchronous, uses the `request` library):
 - `org-conf-rest-post-page` — POST a new (empty) page under an optional parent, returning `(:id :webui)`
 - `org-conf-rest-get-page-info` / `org-conf-rest-list-attachments` — adapters that
   normalize REST JSON into the dispatcher plists
+- `org-conf-rest-search-pages` — CQL title search (`title ~ … and space = …`)
 
 CLI implementation (`confluence` 2.29.0, `--json` output):
 - `org-conf--cli-json` — runs `confluence --json …` via `call-process`, captures
@@ -168,7 +177,8 @@ CLI implementation (`confluence` 2.29.0, `--json` output):
   transport seam
 - `org-conf--with-temp-body` — writes UTF-8 page bodies to a temp file for `--file`
 - `org-conf-cli-get-page-info`, `-get-children`, `-get-space-roots`,
-  `-create-page`, `-update-page`, `-list-attachments`, `-upload-attachment`
+  `-create-page`, `-update-page`, `-list-attachments`, `-upload-attachment`,
+  `-search-pages`
 
 `org-conf--fetch-all-pages` is the shared paginator behind both REST listings: it
 walks `_links.next` up to `org-conf--max-child-page-requests` requests and flattens
@@ -177,6 +187,12 @@ walks `_links.next` up to `org-conf--max-child-page-requests` requests and flatt
 space-content shape. The API paths themselves are built by the pure
 `org-conf--child-page-api` and `org-conf--space-root-page-api`;
 `org-conf--cli-api-path` strips the REST prefix for the CLI's `api` command.
+
+Parent discovery is built on top of these: `org-conf--infer-parent-scope`
+infers the starting page from the local directory, `org-conf--common-ancestor`
+computes the deepest shared ancestor of exported siblings,
+`org-conf--recent-parent-choices` turns the frequency file into `★ 就用 …`
+shortcuts, and `org-conf--drill-choices` builds the file-like menu.
 
 REST authentication uses HTTP Basic Auth through Emacs' `auth-source`, which caches credentials. `org-conf-forget-password` clears that cache only; the CLI manages its own profile credentials.
 

@@ -109,10 +109,14 @@ Prerequisites:
     - Specify ~org-conf-jria-chart-server-id~ according to your case.
     - Optionally specify ~org-conf-root-parent-page~ (a page URL or
       id): when set, parent pages are picked from that page's
-      descendants.  When it is left empty, you walk the space's page
-      tree one level at a time instead.  Either way candidates are
-      listed by page title, most-used first, and a URL can still be
-      typed by hand.
+      descendants.  When it is left empty, the picker infers a scope
+      from the current file's local directory (the common ancestor of
+      nearby exported .org files, then the parent of the most-used
+      parent page, then a title match) and starts there.  Menus are
+      file-like: ~..~ goes to the parent page, direct children are
+      entered, and ~✓ 就用 …~ settles on the current page.  Frequently
+      used parents are offered first.  Candidates show titles, never
+      URLs; a URL can still be typed by hand.
     - Choose the transport with ~org-conf-backend~:
       - ~auto~ (default): use the =confluence= CLI when
         ~org-conf-cli-program~ is on ~exec-path~, otherwise the REST
@@ -182,6 +186,12 @@ Change Log:
                 now unwrapped and paginated.  CONF_* stays below a
                 leading shebang / mode line.  Added the =confluence=
                 CLI backend behind ~org-conf-backend~ (auto/rest/cli).
+  - 2026-10-27: The parent picker infers its scope from the local
+                directory (sibling CONF pages, the parent of the
+                most-used parent, then a title match) and walks direct
+                children with =..= / confirm, like file navigation.
+                Frequent parents come first; URLs only appear in the
+                manual action.
 
 * Example
 Given this file: =tmp.org=.

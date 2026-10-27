@@ -40,10 +40,14 @@
 ;;     - Specify ~org-conf-jria-chart-server-id~ according to your case.
 ;;     - Optionally specify ~org-conf-root-parent-page~ (a page URL or
 ;;       id): when set, parent pages are picked from that page's
-;;       descendants.  When it is left empty, you walk the space's page
-;;       tree one level at a time instead.  Either way candidates are
-;;       listed by page title, most-used first, and a URL can still be
-;;       typed by hand.
+;;       descendants.  When it is left empty, the picker infers a scope
+;;       from the current file's local directory (the common ancestor of
+;;       nearby exported .org files, then the parent of the most-used
+;;       parent page, then a title match) and starts there.  Menus are
+;;       file-like: `..' goes to the parent page, direct children are
+;;       entered, and `✓ 就用 …' settles on the current page.
+;;       Frequently used parents are offered first.  Candidates show
+;;       titles, never URLs; a URL can still be typed by hand.
 ;;     - Choose the transport with ~org-conf-backend~:
 ;;         - ~auto~ (default): use the =confluence= CLI when
 ;;           ~org-conf-cli-program~ is on ~exec-path~, otherwise the
@@ -113,12 +117,19 @@
 ;;                 now unwrapped and paginated.  CONF_* stays below a
 ;;                 leading shebang / mode line.  Added the =confluence=
 ;;                 CLI backend behind ~org-conf-backend~ (auto/rest/cli).
+;;   - 2026-10-27: The parent picker infers its scope from the local
+;;                 directory (sibling CONF pages, the parent of the
+;;                 most-used parent, then a title match) and walks direct
+;;                 children with `..'/confirm, like file navigation.
+;;                 Frequent parents come first; URLs only appear in the
+;;                 manual action.
 
 
 ;;; Code:
 
 (require 'ox)
 (require 'request)
+(require 'url-util)
 
 ;;; ======================================================================
 (defcustom org-conf-url
@@ -880,6 +891,19 @@ Guards against a huge space making the prompt take forever."
   :type 'integer
   :group 'org-export-conf)
 
+(defcustom org-conf-scope-search-depth 2
+  "How many directory levels to climb when inferring the parent scope.
+The scope is learned from sibling .org files that already carry
+#+CONF_ID, so a file in a new subdirectory still finds its Confluence
+subtree."
+  :type 'integer
+  :group 'org-export-conf)
+
+(defcustom org-conf-recent-parent-limit 5
+  "How many frequently used parent pages to offer first."
+  :type 'integer
+  :group 'org-export-conf)
+
 (defun org-conf--page-path (node table)
   "Return NODE's ancestor chain as a \"Root / Mid / Leaf\" string.
 NODE is a plist holding :id, :title and :parent-id.  TABLE maps page
@@ -1172,28 +1196,33 @@ and the second entry could never be selected."
   :type 'string
   :group 'org-export-conf)
 
-(defconst org-conf--drill-up-label "↑ 返回上一层"
-  "The choice that climbs one level back up the page tree during drill-down.")
+(defconst org-conf--drill-up-label ".."
+  "The choice that climbs to the parent page during drill-down.")
 
 (defun org-conf--drill-confirm-label (title)
   "Return the drill-down choice that settles on TITLE as the parent page."
   (format "✓ 就用「%s」作为父页面" title))
 
-(defun org-conf--drill-choices (current children)
+(defun org-conf--drill-choices (current children &optional recent)
   "Build the `completing-read' choices for one drill-down step.
 CURRENT is the page being offered for confirmation, or nil when we are
 at the space top level.  CHILDREN are CURRENT's child pages, which the
-user may descend into.
+user may descend into.  RECENT are already-built `(use ID)' shortcuts
+for frequently used pages.
 
-Return an alist of (DISPLAY . ACTION).  ACTION is a list -- `(root)',
-`(up)', `(manual)', `(confirm ID)' or `(descend ID)' -- so that picking
-a page walks into it while the first entry settles on the current one."
+Return an alist of (DISPLAY . ACTION).  ACTION is `(root)', `(up)',
+`(manual)', `(confirm ID)', `(use ID)' or `(descend ID)'.  The file-like
+order is `..', the current page, recent pages, direct children, manual."
   (append
    (if current
-       (list (cons (org-conf--drill-confirm-label (plist-get current :title))
-                   (list 'confirm (plist-get current :id)))
-             (cons org-conf--drill-up-label '(up)))
+       (let ((parent-id (plist-get current :parent-id)))
+         (list (cons (if parent-id org-conf--drill-up-label
+                       org-conf-parent-root-label)
+                     (if parent-id '(up) '(root)))
+               (cons (org-conf--drill-confirm-label (plist-get current :title))
+                     (list 'confirm (plist-get current :id)))))
      (list (cons org-conf-parent-root-label '(root))))
+   recent
    (mapcar (lambda (pair) (cons (car pair) (list 'descend (cdr pair))))
            (org-conf--unique-labels
             (mapcar (lambda (c) (cons (plist-get c :title) (plist-get c :id)))
@@ -1412,7 +1441,8 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
      (:create-page . org-conf-rest-post-page)
      (:update-page . org-conf-rest-put)
      (:list-attachments . org-conf-rest-list-attachments)
-     (:upload-attachment . org-conf-rest-post-file))
+     (:upload-attachment . org-conf-rest-post-file)
+     (:search-pages . org-conf-rest-search-pages))
     (cli
      (:get-page-info . org-conf-cli-get-page-info)
      (:get-children . org-conf-cli-get-children)
@@ -1420,7 +1450,8 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
      (:create-page . org-conf-cli-create-page)
      (:update-page . org-conf-cli-update-page)
      (:list-attachments . org-conf-cli-list-attachments)
-     (:upload-attachment . org-conf-cli-upload-attachment)))
+     (:upload-attachment . org-conf-cli-upload-attachment)
+     (:search-pages . org-conf-cli-search-pages)))
   "Backend implementations, as an alist of BACKEND . ((OP . FUNCTION) ...).")
 
 (defun org-conf--backend-fn (op)
@@ -1455,6 +1486,10 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
   "Return PAGE-ID's attachments from the active backend."
   (funcall (org-conf--backend-fn :list-attachments) page-id))
 
+(defun org-conf-backend-search-pages (space query)
+  "Return pages in SPACE whose titles match QUERY."
+  (funcall (org-conf--backend-fn :search-pages) space query))
+
 (defun org-conf-backend-upload-attachment (page-id filepath &optional attach-id)
   "Upload FILEPATH to PAGE-ID through the active backend."
   (funcall (org-conf--backend-fn :upload-attachment)
@@ -1462,15 +1497,21 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
 
 (defun org-conf-rest-get-page-info (page-id)
   "Return PAGE-ID's metadata as a plist from the REST API.
-Keys: :id, :title, :version, :space, :parent-id and :url."
+Keys: :id, :title, :version, :space, :parent-id, :ancestors and :url.
+:ancestors is the root-first chain of (:id :title) plists above the page."
   (let ((json (org-conf-rest-get-page-json page-id)))
     (when json
-      (let ((ancestors (append (cdr (assoc 'ancestors json)) nil)))
+      (let* ((raw-ancestors (append (cdr (assoc 'ancestors json)) nil))
+             (ancestors (mapcar (lambda (ancestor)
+                                  (list :id (cdr (assoc 'id ancestor))
+                                        :title (cdr (assoc 'title ancestor))))
+                                raw-ancestors)))
         (list :id (or (cdr (assoc 'id json)) page-id)
               :title (cdr (assoc 'title json))
               :version (cdr (assoc 'number (assoc 'version json)))
               :space (cdr (assoc 'key (assoc 'space json)))
-              :parent-id (cdr (assoc 'id (car (last ancestors))))
+              :parent-id (cdr (assoc 'id (car (last raw-ancestors))))
+              :ancestors ancestors
               :url (org-conf--page-url (org-conf--json-link json 'webui)))))))
 
 (defun org-conf-rest-list-attachments (page-id)
@@ -1480,6 +1521,19 @@ Keys: :id, :title, :version, :space, :parent-id and :url."
                   :title (plist-get attachment :title)))
           (append (plist-get (org-conf-rest-get-attach-json page-id) :results)
                   nil)))
+
+(defun org-conf-rest-search-pages (space query)
+  "Return pages in SPACE whose title matches QUERY, via CQL."
+  (let* ((cql (format "title ~ \"%s\" and space = \"%s\"" query space))
+         (json (org-conf--rest-get-json
+                (format "/rest/api/content/search?cql=%s&limit=%s"
+                        (url-hexify-string cql)
+                        org-conf-parent-child-page-limit))))
+    (mapcar (lambda (result)
+              (list :id (cdr (assoc 'id result))
+                    :title (cdr (assoc 'title result))
+                    :type (cdr (assoc 'type result))))
+            (append (cdr (assoc 'results json)) nil))))
 
 ;;; ======================================================================
 ;;;                     confluence-cli Process Layer
@@ -1569,13 +1623,19 @@ transport without redefining `org-conf--cli-json'.")
   (replace-regexp-in-string "\\`/*\\(?:rest/api/\\)?" "" api))
 
 (defun org-conf-cli-get-page-info (page-id)
-  "Return PAGE-ID's metadata as a plist from the confluence CLI."
-  (let ((json (org-conf--cli-invoke "info" page-id)))
+  "Return PAGE-ID's metadata as a plist from the confluence CLI.
+Keys: :id, :title, :version, :space, :parent-id, :ancestors and :url."
+  (let* ((json (org-conf--cli-invoke "info" page-id))
+         (ancestors (mapcar (lambda (ancestor)
+                              (list :id (alist-get 'id ancestor)
+                                    :title (alist-get 'title ancestor)))
+                            (alist-get 'ancestors json))))
     (list :id (alist-get 'id json)
           :title (alist-get 'title json)
           :version (alist-get 'version json)
           :space (alist-get 'spaceKey json)
           :parent-id (alist-get 'parentId json)
+          :ancestors ancestors
           :url (alist-get 'url json))))
 
 (defun org-conf-cli-get-children (page-id)
@@ -1630,6 +1690,19 @@ ignored: the CLI fetches the current version itself."
             (list :id (alist-get 'id attachment)
                   :title (alist-get 'title attachment)))
           (alist-get 'attachments (org-conf--cli-invoke "attachments" page-id))))
+
+(defun org-conf-cli-search-pages (space query)
+  "Return pages in SPACE whose title matches QUERY, via the CLI."
+  (let ((cql (format "title ~ \"%s\" and space = \"%s\"" query space)))
+    (mapcar (lambda (result)
+              (list :id (alist-get 'id result)
+                    :title (alist-get 'title result)
+                    :type (alist-get 'type result)))
+            (alist-get 'results
+                       (org-conf--cli-invoke
+                        "search" cql "--cql"
+                        "--limit" (number-to-string
+                                   org-conf-parent-child-page-limit))))))
 
 (defun org-conf-cli-upload-attachment (page-id filepath &optional attach-id)
   "Upload FILEPATH to PAGE-ID through the CLI.
@@ -1753,6 +1826,196 @@ failed read, while the CLI backend raises."
      (message "%s" (error-message-string err))
      nil)))
 
+(defvar org-conf--page-info-cache (make-hash-table :test 'equal)
+  "Session cache of page metadata, keyed by page id.")
+
+(defvar org-conf--scope-cache (make-hash-table :test 'equal)
+  "Session cache of inferred parent scopes, keyed by DIRECTORY\\0SPACE.")
+
+(defun org-conf--cached-page-info (page-id)
+  "Return PAGE-ID's metadata, caching successful reads for this session."
+  (let ((cached (gethash page-id org-conf--page-info-cache 'miss)))
+    (if (not (eq cached 'miss))
+        cached
+      (let ((info (org-conf--read-or-nil #'org-conf-backend-get-page-info page-id)))
+        (when info
+          (puthash page-id info org-conf--page-info-cache))
+        info))))
+
+(defun org-conf--common-prefix (a b)
+  "Return the common prefix of ancestor lists A and B."
+  (let ((prefix nil))
+    (while (and a b (equal (plist-get (car a) :id)
+                           (plist-get (car b) :id)))
+      (push (car a) prefix)
+      (setq a (cdr a)
+            b (cdr b)))
+    (nreverse prefix)))
+
+(defun org-conf--common-ancestor (chains)
+  "Return the deepest plist shared by all CHAINS, or nil.
+Each CHAIN is a root-first list of (:id :title) plists."
+  (let ((chains (delq nil (mapcar (lambda (chain)
+                                    (and chain (append chain nil)))
+                                  chains))))
+    (when chains
+      (let ((prefix (car chains)))
+        (dolist (chain (cdr chains))
+          (setq prefix (org-conf--common-prefix prefix chain)))
+        (car (last prefix))))))
+
+(defun org-conf--parent-directory (dir)
+  "Return DIR's parent directory, or nil at the filesystem root."
+  (let* ((expanded (expand-file-name dir))
+         (parent (file-name-directory (directory-file-name expanded))))
+    (unless (equal parent expanded)
+      parent)))
+
+(defun org-conf--org-files-near (dir)
+  "Return .org files in DIR and its immediate subdirectories."
+  (append (directory-files dir t "\\.org\\'" t)
+          (cl-loop for sub in (directory-files dir t "\\`[^.]" t)
+                   when (file-directory-p sub)
+                   append (directory-files sub t "\\.org\\'" t))))
+
+(defun org-conf--conf-ids-in-directory (dir space)
+  "Return up to 8 page ids from .org files near DIR whose CONF_SPACE is SPACE.
+\"Near\" means DIR itself and its immediate subdirectories, so a topic
+directory learns from its sibling topic directories.  The current
+buffer's file is skipped."
+  (let ((current (and buffer-file-name
+                      (ignore-errors (file-truename buffer-file-name))))
+        (ids nil)
+        (count 0))
+    (when (file-directory-p dir)
+      (dolist (file (org-conf--org-files-near dir))
+        (when (and (< count 8)
+                   (not (equal (ignore-errors (file-truename file)) current)))
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (let ((file-space
+                   (when (re-search-forward
+                          "^#\\+CONF_SPACE:[ \t]*\\([^ \t\n]+\\)" nil t)
+                     (match-string 1))))
+              (when (equal space file-space)
+                (goto-char (point-min))
+                (when (re-search-forward
+                       "^#\\+CONF_ID:[ \t]*\\([^ \t\n]+\\)" nil t)
+                  (push (match-string 1) ids)
+                  (setq count (1+ count)))))))))
+    (nreverse ids)))
+
+(defun org-conf--name-matched-scope (space dir)
+  "Find a page in SPACE whose title best matches DIR's name.
+The shortest matching title wins, so `vml' prefers `HygonVML' over
+`HygonVML算法记录'.  Attachments and other non-page results are ignored."
+  (let* ((name (file-name-nondirectory (directory-file-name dir)))
+         (needle (downcase name))
+         (results (org-conf--read-or-nil #'org-conf-backend-search-pages
+                                         space name))
+         (matches (seq-filter
+                   (lambda (page)
+                     (and (or (null (plist-get page :type))
+                              (equal "page" (plist-get page :type)))
+                          (string-match-p
+                           (regexp-quote needle)
+                           (downcase (or (plist-get page :title) "")))))
+                   results))
+         (best (car (sort (copy-sequence matches)
+                          (lambda (a b)
+                            (< (length (plist-get a :title))
+                               (length (plist-get b :title))))))))
+    (when best
+      (org-conf--cached-page-info (plist-get best :id)))))
+
+(defun org-conf--scope-in-directory (dir space)
+  "Return the common ancestor page of DIR's exported .org files."
+  (let ((ancestor (org-conf--common-ancestor
+                   (delq nil
+                         (mapcar (lambda (id)
+                                   (plist-get (org-conf--cached-page-info id)
+                                              :ancestors))
+                                 (org-conf--conf-ids-in-directory dir space))))))
+    (when ancestor
+      (org-conf--cached-page-info (plist-get ancestor :id)))))
+
+(defun org-conf--recent-parent-scope (space)
+  "Return the parent of the most-used parent page in SPACE, if any.
+This turns recently used parents into a starting point for the picker."
+  (let ((freq (sort (copy-sequence
+                     (org-conf--freq-load org-conf-parent-freq-file))
+                    (lambda (a b) (> (cdr a) (cdr b)))))
+        (scope nil)
+        (tried 0))
+    (while (and freq (not scope) (< tried 5))
+      (let ((info (org-conf--cached-page-info (caar freq))))
+        (setq tried (1+ tried))
+        (when (and info (equal space (plist-get info :space)))
+          (let ((parent-id (plist-get info :parent-id)))
+            (setq scope
+                  (if parent-id
+                      (let ((parent (org-conf--cached-page-info parent-id)))
+                        (and parent
+                             (equal space (plist-get parent :space))
+                             parent))
+                    info)))))
+      (setq freq (cdr freq)))
+    scope))
+
+(defun org-conf--infer-parent-scope-uncached (space start)
+  "Infer a parent scope for SPACE starting at directory START.
+Prefer the current directory's exported siblings, then the parent of
+the most-used recent parent, then one or two directories up, then a
+title match on the directory name."
+  (let ((scope (org-conf--scope-in-directory start space))
+        (dir (org-conf--parent-directory start))
+        (depth 1))
+    (unless scope
+      (setq scope (org-conf--recent-parent-scope space)))
+    (while (and dir (not scope) (<= depth org-conf-scope-search-depth))
+      (setq scope (org-conf--scope-in-directory dir space))
+      (setq depth (1+ depth))
+      (unless scope
+        (setq dir (org-conf--parent-directory dir))))
+    (or scope
+        (org-conf--name-matched-scope space start))))
+
+(defun org-conf--infer-parent-scope (space)
+  "Infer the Confluence scope page for the current file's directory.
+The result is cached per directory and space for this session."
+  (let* ((start (file-name-directory (or buffer-file-name default-directory)))
+         (key (concat start "\0" space))
+         (cached (gethash key org-conf--scope-cache 'miss)))
+    (if (not (eq cached 'miss))
+        cached
+      (let ((scope (org-conf--infer-parent-scope-uncached space start)))
+        (puthash key scope org-conf--scope-cache)
+        scope))))
+
+(defun org-conf--recent-parent-choices (space &optional exclude)
+  "Return `(use ID)' shortcuts for the most-used parents in SPACE.
+EXCLUDE lists page ids already offered in the current menu."
+  (let ((freq (sort (copy-sequence
+                     (org-conf--freq-load org-conf-parent-freq-file))
+                    (lambda (a b) (> (cdr a) (cdr b)))))
+        (result nil)
+        (seen nil))
+    (dolist (cell freq)
+      (let ((id (car cell))
+            (count (cdr cell)))
+        (when (and (< (length result) org-conf-recent-parent-limit)
+                   (not (member id exclude))
+                   (not (member id seen)))
+          (let ((info (org-conf--cached-page-info id)))
+            (when (and info (equal space (plist-get info :space)))
+              (push (cons (format "★ 就用 %s (常用 %d 次)"
+                                  (plist-get info :title) count)
+                          (list 'use id))
+                    result)
+              (push id seen))))))
+    (nreverse result)))
+
 (defun org-conf--space-roots-or-warn (space)
   "Return SPACE's top-level pages, warning when the listing came back empty.
 An empty list means either an empty space or that this Confluence
@@ -1764,32 +2027,58 @@ shown a menu with nothing in it."
                space))
     roots))
 
-(defun org-conf--read-parent-by-drill-down (space)
-  "Walk down SPACE's page tree one level at a time; return the parent id.
-Each menu leads with the current page's \"use this\" entry, then the
-level above, then the child pages that can be descended into.  Returns
-nil when the user settles on the space root itself."
-  (let ((current nil)                  ; page we are standing on, or nil for the space top
-        (trail nil)                    ; pages above CURRENT, innermost first
-        (answer 'pending))
+(defun org-conf--parent-page (page)
+  "Return PAGE's parent metadata, or nil at the top."
+  (let ((parent-id (plist-get page :parent-id)))
+    (when parent-id
+      (org-conf--cached-page-info parent-id))))
+
+(defun org-conf--read-parent-by-drill-down (space &optional scope)
+  "Walk SPACE's page tree one level at a time; return the parent id.
+Start at SCOPE when non-nil; `..' climbs to its parent.  Each menu lists
+the current page, frequently used pages, direct children and manual
+entry.  Returns nil when the user settles on the space root itself."
+  (let ((current scope)
+        (trail nil)
+        (answer 'pending)
+        (children-cache (make-hash-table :test 'equal)))
     (while (eq answer 'pending)
-      (let* ((children (if current
-                           (org-conf--read-or-nil
-                            #'org-conf-backend-get-children
-                            (plist-get current :id))
-                         (org-conf--space-roots-or-warn space)))
-             (choices (org-conf--drill-choices current children))
+      (let* ((children
+              (if current
+                  (let ((cached (gethash (plist-get current :id)
+                                         children-cache 'miss)))
+                    (if (eq cached 'miss)
+                        (puthash (plist-get current :id)
+                                 (org-conf--read-or-nil
+                                  #'org-conf-backend-get-children
+                                  (plist-get current :id))
+                                 children-cache)
+                      cached))
+                (org-conf--space-roots-or-warn space)))
+             (recent (org-conf--recent-parent-choices
+                      space
+                      (cons (and current (plist-get current :id))
+                            (mapcar (lambda (child) (plist-get child :id))
+                                    children))))
+             (choices (org-conf--drill-choices current children recent))
              (action (cdr (assoc (completing-read "Parent page: " choices nil t)
                                  choices))))
         (pcase action
           (`(root) (setq answer nil))
-          (`(up) (setq current (pop trail)))
+          (`(up)
+           (if trail
+               (setq current (pop trail))
+             (setq current (org-conf--parent-page current))))
           (`(manual) (setq answer (org-conf--read-parent-id-manually)))
           (`(confirm ,id) (setq answer id))
+          (`(use ,id) (setq answer id))
           (`(descend ,id)
-           (push current trail)
-           (setq current (seq-find (lambda (c) (equal id (plist-get c :id)))
-                                   children))))))
+           (let ((child (seq-find (lambda (c) (equal id (plist-get c :id)))
+                                  children)))
+             (when child
+               (push current trail)
+               (setq current (plist-put child :parent-id
+                                        (plist-get current :id)))))))))
     answer))
 
 (defun org-conf--read-parent-id (space)
@@ -1801,7 +2090,10 @@ a URL can still be typed by hand."
   (let ((root (string-trim org-conf-root-parent-page)))
     (cond
      ((string-empty-p root)
-      (org-conf--read-parent-by-drill-down space))
+      (let ((scope (org-conf--infer-parent-scope space)))
+        (when scope
+          (message "Parent scope: %s" (plist-get scope :title)))
+        (org-conf--read-parent-by-drill-down space scope)))
      ((not (org-conf--return-id-from-url root))
       (message "No page id in `org-conf-root-parent-page' (%s); asking instead."
                root)

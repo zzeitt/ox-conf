@@ -467,6 +467,8 @@
             (org-conf-url "http://wiki.example.com/"))
         (should (equal '(:id "7" :title "Doc" :version 3 :space "DOCS"
                          :parent-id "5"
+                         :ancestors ((:id "1" :title "Root")
+                                     (:id "5" :title "Parent"))
                          :url "http://wiki.example.com/spaces/DOCS/pages/7/Doc")
                        (org-conf-backend-get-page-info "7")))))))
 
@@ -479,6 +481,253 @@
         (should (equal '((:id "a1" :title "a.png")
                          (:id "a2" :title "b.png"))
                        (org-conf-backend-list-attachments "7")))))))
+
+;;; ----------------------------------------------------------------------
+;;; Parent scope inference, recent parents and the file-like menu.
+;;; ----------------------------------------------------------------------
+
+(defun ox-conf-test--reset-parent-caches ()
+  (clrhash org-conf--scope-cache)
+  (clrhash org-conf--page-info-cache))
+
+(ert-deftest ox-conf-test-common-ancestor-picks-the-deepest-shared-page ()
+  (should (equal '(:id "2" :title "Mid")
+                 (org-conf--common-ancestor
+                  (list '((:id "1" :title "Root")
+                          (:id "2" :title "Mid")
+                          (:id "3" :title "A"))
+                        '((:id "1" :title "Root")
+                          (:id "2" :title "Mid")
+                          (:id "4" :title "B")))))))
+
+(ert-deftest ox-conf-test-common-ancestor-of-one-chain-is-its-deepest-page ()
+  (should (equal '(:id "5" :title "Parent")
+                 (org-conf--common-ancestor
+                  (list '((:id "1" :title "Root")
+                          (:id "5" :title "Parent")))))))
+
+(ert-deftest ox-conf-test-common-ancestor-of-disjoint-chains-is-nil ()
+  (should (null (org-conf--common-ancestor
+                 (list '((:id "1" :title "A"))
+                       '((:id "2" :title "B")))))))
+
+(ert-deftest ox-conf-test-infer-scope-uses-sibling-conf-pages ()
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (dir (make-temp-file "ox-conf-scope-" t))
+         (file (expand-file-name "current.org" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "a.org" dir)
+            (insert "#+CONF_SPACE: SSC\n#+CONF_ID: 10\n"))
+          (with-temp-file (expand-file-name "b.org" dir)
+            (insert "#+CONF_SPACE: SSC\n#+CONF_ID: 11\n"))
+          (ox-conf-test--reset-parent-caches)
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                       (lambda (id)
+                         (pcase id
+                           ("10" (list :id id :title "A" :space "SSC"
+                                       :parent-id "2"
+                                       :ancestors '((:id "1" :title "Root")
+                                                    (:id "2" :title "Mid"))))
+                           ("11" (list :id id :title "B" :space "SSC"
+                                       :parent-id "3"
+                                       :ancestors '((:id "1" :title "Root")
+                                                    (:id "2" :title "Mid")
+                                                    (:id "3" :title "Leaf"))))
+                           ("2" (list :id id :title "Mid" :space "SSC"
+                                      :parent-id "1"
+                                      :ancestors '((:id "1" :title "Root"))))))))
+              (should (equal '(:id "2" :title "Mid" :space "SSC"
+                               :parent-id "1"
+                               :ancestors ((:id "1" :title "Root")))
+                             (org-conf--infer-parent-scope "SSC"))))))
+      (delete-directory dir t))))
+
+(ert-deftest ox-conf-test-infer-scope-climbs-a-directory ()
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (base (make-temp-file "ox-conf-scope-" t))
+         (sub (expand-file-name "sub" base))
+         (file (expand-file-name "current.org" sub)))
+    (make-directory sub)
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "sib.org" base)
+            (insert "#+CONF_SPACE: SSC\n#+CONF_ID: 20\n"))
+          (ox-conf-test--reset-parent-caches)
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                       (lambda (id)
+                         (pcase id
+                           ("20" (list :id id :title "Sib" :space "SSC"
+                                       :parent-id "2"
+                                       :ancestors '((:id "1" :title "Root")
+                                                    (:id "2" :title "Mid"))))
+                           ("2" (list :id id :title "Mid" :space "SSC"
+                                      :parent-id "1"
+                                      :ancestors '((:id "1" :title "Root"))))))))
+              (should (equal '(:id "2" :title "Mid" :space "SSC"
+                               :parent-id "1"
+                               :ancestors ((:id "1" :title "Root")))
+                             (org-conf--infer-parent-scope "SSC"))))))
+      (delete-directory base t))))
+
+(ert-deftest ox-conf-test-infer-scope-prefers-the-recent-parent ()
+  "With no exported siblings, the most-used parent page supplies the scope."
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (dir (make-temp-file "ox-conf-scope-" t))
+         (file (expand-file-name "current.org" dir)))
+    (unwind-protect
+        (progn
+          (org-conf--freq-save org-conf-parent-freq-file '(("42" . 2)))
+          (ox-conf-test--reset-parent-caches)
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                       (lambda (id)
+                         (pcase id
+                           ("42" (list :id id :title "HygonVML算法记录"
+                                       :space "SSC" :parent-id "2"))
+                           ("2" (list :id id :title "HygonVML"
+                                      :space "SSC" :parent-id "1"
+                                      :ancestors '((:id "1" :title "Root"))))))))
+              (should (equal '(:id "2" :title "HygonVML" :space "SSC"
+                               :parent-id "1"
+                               :ancestors ((:id "1" :title "Root")))
+                             (org-conf--infer-parent-scope "SSC"))))))
+      (delete-file org-conf-parent-freq-file))))
+
+(ert-deftest ox-conf-test-infer-scope-falls-back-to-title-search ()
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (base (make-temp-file "ox-conf-scope-" t))
+         (dir (expand-file-name "vml" base))
+         (file (expand-file-name "current.org" dir)))
+    (make-directory dir)
+    (unwind-protect
+        (progn
+          (ox-conf-test--reset-parent-caches)
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (cl-letf (((symbol-function 'org-conf-backend-search-pages)
+                       (lambda (_space query)
+                         (should (equal "vml" query))
+                         '((:id "9" :title "perf_vml.csv" :type "attachment")
+                           (:id "2" :title "HygonVML" :type "page")
+                           (:id "3" :title "HygonVML算法记录" :type "page"))))
+                      ((symbol-function 'org-conf-backend-get-page-info)
+                       (lambda (id)
+                         (should (equal "2" id))
+                         (list :id id :title "HygonVML" :space "SSC"
+                               :parent-id "1"
+                               :ancestors '((:id "1" :title "Root"))))))
+              (should (equal '(:id "2" :title "HygonVML" :space "SSC"
+                               :parent-id "1"
+                               :ancestors ((:id "1" :title "Root")))
+                             (org-conf--infer-parent-scope "SSC"))))))
+      (delete-directory base t))))
+
+(ert-deftest ox-conf-test-recent-parent-choices-filters-space-and-sorts ()
+  (ox-conf-test--reset-parent-caches)
+  (cl-letf (((symbol-function 'org-conf--freq-load)
+             (lambda (_file) '(("a" . 3) ("b" . 1) ("c" . 2))))
+            ((symbol-function 'org-conf-backend-get-page-info)
+             (lambda (id)
+               (pcase id
+                 ("a" (list :id id :title "HygonVML算法记录" :space "SSC"))
+                 ("b" (list :id id :title "Other" :space "OTHER"))
+                 ("c" (list :id id :title "HygonVML研发记录" :space "SSC"))))))
+    (should (equal (list (cons "★ 就用 HygonVML算法记录 (常用 3 次)" '(use "a"))
+                         (cons "★ 就用 HygonVML研发记录 (常用 2 次)" '(use "c")))
+                   (org-conf--recent-parent-choices "SSC")))))
+
+(ert-deftest ox-conf-test-recent-parent-choices-dedups-and-limits ()
+  (ox-conf-test--reset-parent-caches)
+  (let ((freq '(("a" . 5) ("b" . 4) ("c" . 3)
+                ("d" . 2) ("e" . 1) ("f" . 1))))
+    (cl-letf (((symbol-function 'org-conf--freq-load) (lambda (_file) freq))
+              ((symbol-function 'org-conf-backend-get-page-info)
+               (lambda (id) (list :id id :title (format "Page-%s" id)
+                                  :space "SSC")))
+              ((symbol-value 'org-conf-recent-parent-limit) 5))
+      (let ((choices (org-conf--recent-parent-choices "SSC" '("a"))))
+        (should (= 5 (length choices)))
+        (should-not (seq-find (lambda (c) (string-match-p "Page-a" (car c)))
+                              choices))))))
+
+(ert-deftest ox-conf-test-drill-choices-are-file-like ()
+  (let ((current '(:id "2" :title "HygonVML" :parent-id "1"))
+        (children '((:id "3" :title "算法记录") (:id "4" :title "研发记录")))
+        (recent (list (cons "★ 就用 算法记录 (常用 2 次)" '(use "3")))))
+    (should (equal (list (cons ".." '(up))
+                         (cons "✓ 就用「HygonVML」作为父页面" '(confirm "2"))
+                         (cons "★ 就用 算法记录 (常用 2 次)" '(use "3"))
+                         (cons "算法记录" '(descend "3"))
+                         (cons "研发记录" '(descend "4"))
+                         (cons "（手动输入页面 URL/ID）" '(manual)))
+                   (org-conf--drill-choices current children recent)))))
+
+(ert-deftest ox-conf-test-drill-down-uses-a-recent-entry ()
+  (let* ((org-conf-parent-freq-file (make-temp-file "ox-conf-freq" nil ".eld"))
+         (stub (ox-conf-test--drill-stub '("★ 就用 目标 (常用 2 次)"))))
+    (unwind-protect
+        (progn
+          (org-conf--freq-save org-conf-parent-freq-file '(("42" . 2)))
+          (ox-conf-test--reset-parent-caches)
+          (cl-letf (((symbol-function 'completing-read) (car stub))
+                    ((symbol-function 'org-conf-backend-get-space-roots)
+                     (lambda (_space) '((:id "1" :title "Root"))))
+                    ((symbol-function 'org-conf-backend-get-page-info)
+                     (lambda (id) (list :id id :title "目标" :space "SSC"))))
+            (should (equal "42" (org-conf--read-parent-by-drill-down "SSC")))))
+      (delete-file org-conf-parent-freq-file))))
+
+(ert-deftest ox-conf-test-drill-down-dotdot-fetches-the-parent ()
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (stub (ox-conf-test--drill-stub '(".." "✓ 就用「Parent」作为父页面")))
+         (scope '(:id "2" :title "Child" :parent-id "1")))
+    (cl-letf (((symbol-function 'completing-read) (car stub))
+              ((symbol-function 'org-conf-backend-get-children)
+               (lambda (_id) nil))
+              ((symbol-function 'org-conf-backend-get-page-info)
+               (lambda (id) (list :id id :title "Parent" :parent-id nil))))
+      (should (equal "1" (org-conf--read-parent-by-drill-down "SSC" scope))))))
+
+(ert-deftest ox-conf-test-read-parent-id-starts-at-the-inferred-scope ()
+  (let ((org-conf-root-parent-page "")
+        (scope '(:id "2" :title "HygonVML" :parent-id "1")))
+    (cl-letf (((symbol-function 'org-conf--infer-parent-scope)
+               (lambda (space) (should (equal "SSC" space)) scope))
+              ((symbol-function 'org-conf--read-parent-by-drill-down)
+               (lambda (space scope-arg)
+                 (should (equal "SSC" space))
+                 (should (equal scope scope-arg))
+                 "42")))
+      (should (equal "42" (org-conf--read-parent-id "SSC"))))))
+
+(ert-deftest ox-conf-test-cli-search-pages-builds-cql ()
+  (cl-letf (((symbol-value 'org-conf--cli-json-function)
+             (lambda (&rest args)
+               (should (equal '("search" "title ~ \"vml\" and space = \"SSC\""
+                                "--cql" "--limit" "20")
+                              args))
+               '((results . (((id . "1") (title . "HygonVML") (type . "page"))))))))
+    (let ((org-conf-parent-child-page-limit 20))
+      (should (equal '((:id "1" :title "HygonVML" :type "page"))
+                     (org-conf-cli-search-pages "SSC" "vml"))))))
+
+(ert-deftest ox-conf-test-rest-search-pages-builds-cql ()
+  (let (api)
+    (cl-letf (((symbol-function 'org-conf--rest-get-json)
+               (lambda (path)
+                 (setq api path)
+                 '((results . [((id . "1") (title . "HygonVML") (type . "page"))])))))
+      (let ((org-conf-parent-child-page-limit 20))
+        (should (equal '((:id "1" :title "HygonVML" :type "page"))
+                       (org-conf-rest-search-pages "SSC" "vml")))
+        (should (string-match-p "\\`/rest/api/content/search[?]cql=" api))
+        (should (string-match-p "limit=20" api))))))
 
 ;;; ----------------------------------------------------------------------
 ;;; The CLI process layer: arguments, JSON, errors, temp bodies.
@@ -552,9 +801,14 @@
                (should (equal '("info" "7") args))
                '((id . "7") (title . "Doc") (version . 3)
                  (spaceKey . "DOCS") (parentId . "5")
+                 (ancestors . (((id . "1") (title . "Root"))
+                               ((id . "5") (title . "Parent"))))
                  (url . "http://x/pages/7")))))
     (should (equal '(:id "7" :title "Doc" :version 3 :space "DOCS"
-                     :parent-id "5" :url "http://x/pages/7")
+                     :parent-id "5"
+                     :ancestors ((:id "1" :title "Root")
+                                 (:id "5" :title "Parent"))
+                     :url "http://x/pages/7")
                    (org-conf-cli-get-page-info "7")))))
 
 (ert-deftest ox-conf-test-cli-get-children-maps-json ()
@@ -904,20 +1158,20 @@
                    (org-conf--drill-choices nil children)))))
 
 (ert-deftest ox-conf-test-drill-choices-below-the-top ()
-  "Standing on a page, offer to confirm it, go up, descend, or type a url."
-  (let ((current '(:id "1" :title "Alpha"))
+  "Standing on a page, offer to go up, confirm it, descend, or type a url."
+  (let ((current '(:id "1" :title "Alpha" :parent-id "0"))
         (children '((:id "3" :title "Alpha-1"))))
-    (should (equal (list (cons "✓ 就用「Alpha」作为父页面" '(confirm "1"))
-                         '("↑ 返回上一层" up)
+    (should (equal (list '(".." up)
+                         (cons "✓ 就用「Alpha」作为父页面" '(confirm "1"))
                          '("Alpha-1" descend "3")
                          (cons "（手动输入页面 URL/ID）" '(manual)))
                    (org-conf--drill-choices current children)))))
 
 (ert-deftest ox-conf-test-drill-choices-work-on-a-leaf ()
   "A page with no children can still be confirmed or left."
-  (let ((current '(:id "3" :title "Leaf")))
-    (should (equal (list (cons "✓ 就用「Leaf」作为父页面" '(confirm "3"))
-                         '("↑ 返回上一层" up)
+  (let ((current '(:id "3" :title "Leaf" :parent-id "1")))
+    (should (equal (list '(".." up)
+                         (cons "✓ 就用「Leaf」作为父页面" '(confirm "3"))
                          (cons "（手动输入页面 URL/ID）" '(manual)))
                    (org-conf--drill-choices current nil)))))
 
@@ -947,7 +1201,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 
 (ert-deftest ox-conf-test-drill-down-walks-to-the-confirmed-page ()
   "Descending twice and confirming the leaf yields that leaf's id."
-  (let* ((stub (ox-conf-test--drill-stub
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (stub (ox-conf-test--drill-stub
                 '("Alpha" "Alpha-1" "✓ 就用「Alpha-1」作为父页面")))
          (menus (cdr stub)))
     (cl-letf (((symbol-function 'completing-read) (car stub))
@@ -958,14 +1213,15 @@ list of menus that were shown, in order.  The getter is repeatable."
       (should (equal "2" (org-conf--read-parent-by-drill-down "DOCS")))
       ;; Three menus: the space top, inside Alpha, then standing on the leaf.
       (should (equal '(("（建在 space 根目录）" "Alpha" "（手动输入页面 URL/ID）")
-                       ("✓ 就用「Alpha」作为父页面" "↑ 返回上一层" "Alpha-1"
-                        "（手动输入页面 URL/ID）")
-                       ("✓ 就用「Alpha-1」作为父页面" "↑ 返回上一层"
+                       ("（建在 space 根目录）" "✓ 就用「Alpha」作为父页面"
+                        "Alpha-1" "（手动输入页面 URL/ID）")
+                       (".." "✓ 就用「Alpha-1」作为父页面"
                         "（手动输入页面 URL/ID）"))
                      (funcall menus))))))
 
 (ert-deftest ox-conf-test-drill-down-can-stop-at-the-space-root ()
-  (let ((stub (ox-conf-test--drill-stub '("（建在 space 根目录）"))))
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (stub (ox-conf-test--drill-stub '("（建在 space 根目录）"))))
     (cl-letf (((symbol-function 'completing-read) (car stub))
               ((symbol-function 'org-conf-backend-get-space-roots)
                (lambda (_space) '((:id "1" :title "Alpha")))))
@@ -973,21 +1229,22 @@ list of menus that were shown, in order.  The getter is repeatable."
 
 (ert-deftest ox-conf-test-drill-down-can-climb-back-up ()
   "Going up returns to the previous level's menu, not to the top blindly."
-  (let* ((stub (ox-conf-test--drill-stub
-                '("Alpha" "↑ 返回上一层" "（建在 space 根目录）")))
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (scope '(:id "2" :title "Alpha" :parent-id "1"))
+         (stub (ox-conf-test--drill-stub
+                '("Alpha-1" ".." "✓ 就用「Alpha」作为父页面")))
          (menus (cdr stub)))
     (cl-letf (((symbol-function 'completing-read) (car stub))
-              ((symbol-function 'org-conf-backend-get-space-roots)
-               (lambda (_space) '((:id "1" :title "Alpha"))))
               ((symbol-function 'org-conf-backend-get-children)
-               (lambda (_id) '((:id "2" :title "Alpha-1")))))
-      (should (null (org-conf--read-parent-by-drill-down "DOCS")))
-      (should (member "Alpha-1" (nth 1 (funcall menus))))
+               (lambda (_id) '((:id "3" :title "Alpha-1")))))
+      (should (equal "2" (org-conf--read-parent-by-drill-down "DOCS" scope)))
+      (should (member "Alpha-1" (nth 0 (funcall menus))))
       (should (equal (nth 0 (funcall menus)) (nth 2 (funcall menus)))))))
 
 (ert-deftest ox-conf-test-drill-down-falls-back-to-a-typed-url ()
   "The manual entry keeps working for pages outside the space tree."
-  (let ((stub (ox-conf-test--drill-stub '("（手动输入页面 URL/ID）"))))
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (stub (ox-conf-test--drill-stub '("（手动输入页面 URL/ID）"))))
     (cl-letf (((symbol-function 'completing-read) (car stub))
               ((symbol-function 'read-string)
                (lambda (&rest _) "https://wiki.example.com/pages/777"))
@@ -996,7 +1253,8 @@ list of menus that were shown, in order.  The getter is repeatable."
       (should (equal "777" (org-conf--read-parent-by-drill-down "DOCS"))))))
 
 (ert-deftest ox-conf-test-drill-down-survives-a-failing-space-root-listing ()
-  (let ((stub (ox-conf-test--drill-stub '("（手动输入页面 URL/ID）"))))
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (stub (ox-conf-test--drill-stub '("（手动输入页面 URL/ID）"))))
     (cl-letf (((symbol-function 'completing-read) (car stub))
               ((symbol-function 'read-string) (lambda (&rest _) ""))
               ((symbol-function 'org-conf-backend-get-space-roots)
@@ -1004,8 +1262,9 @@ list of menus that were shown, in order.  The getter is repeatable."
       (should (null (org-conf--read-parent-by-drill-down "DOCS"))))))
 
 (ert-deftest ox-conf-test-drill-down-survives-a-failing-child-listing ()
-  (let ((stub (ox-conf-test--drill-stub
-               '("Alpha" "✓ 就用「Alpha」作为父页面"))))
+  (let* ((org-conf-parent-freq-file (make-temp-name "/tmp/ox-conf-empty-freq-"))
+         (stub (ox-conf-test--drill-stub
+                '("Alpha" "✓ 就用「Alpha」作为父页面"))))
     (cl-letf (((symbol-function 'completing-read) (car stub))
               ((symbol-function 'org-conf-backend-get-space-roots)
                (lambda (_space) '((:id "1" :title "Alpha"))))
@@ -1021,8 +1280,11 @@ list of menus that were shown, in order.  The getter is repeatable."
   "With no `org-conf-root-parent-page', fall back to the space drill-down."
   (let ((org-conf-root-parent-page "")
         (asked nil))
-    (cl-letf (((symbol-function 'org-conf--read-parent-by-drill-down)
-               (lambda (space) (setq asked space) "42")))
+    (cl-letf (((symbol-function 'org-conf--infer-parent-scope)
+               (lambda (_space) nil))
+              ((symbol-function 'org-conf--read-parent-by-drill-down)
+               (lambda (space &optional _scope)
+                 (setq asked space) "42")))
       (should (equal "42" (org-conf--read-parent-id "DOCS")))
       (should (equal "DOCS" asked)))))
 
