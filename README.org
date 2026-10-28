@@ -144,9 +144,20 @@ Options:
   - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
   - ~f r~: "Forget the wrong password" (REST auth cache only)
            org-conf-forget-password
+  - ~f l~: "Show debug log" org-conf-show-log
 
 Response:
   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
+
+Debug log:
+  - Every backend call appends a timestamped ~✅~/~❌~ line to
+    ~org-conf-log-buffer-name~ (default =*ox-conf-log*=), with timing.
+    CLI calls also log the exact =confluence --json ...= command; a
+    failed call logs a copy-pasteable elisp form with the active backend.
+  - Page bodies go to a temporary UTF-8 file.  If the call fails, the
+    file is kept and its path is logged, so the command can be rerun.
+  - =f l= opens the log; ~org-conf-log-enabled~ turns it off and
+    ~org-conf-log-max-lines~ caps its size.
 
 Note:
   Most of the codes in this file are adapted from =ox-html.el=.
@@ -192,6 +203,9 @@ Change Log:
                 children with =..= / confirm, like file navigation.
                 Frequent parents come first; URLs only appear in the
                 manual action.
+  - 2026-10-28: Added a background debug log (=*ox-conf-log*=, =f l=):
+                every backend call logs ✅/❌ with timing, CLI commands,
+                elisp reproduction forms, and keeps failed body files.
 
 * Example
 Given this file: =tmp.org=.

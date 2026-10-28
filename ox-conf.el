@@ -75,9 +75,20 @@
 ;;   - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
 ;;   - ~f r~: "Forget the wrong password" (REST auth cache only)
 ;;            org-conf-forget-password
+;;   - ~f l~: "Show debug log" org-conf-show-log
 ;;
 ;; Response:
 ;;   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
+;;
+;; Debug log:
+;;   - Every backend call appends a timestamped `✅'/`❌' line to
+;;     ~org-conf-log-buffer-name~ (default =*ox-conf-log*=), with timing.
+;;     CLI calls also log the exact =confluence --json ...= command; a
+;;     failed call logs a copy-pasteable elisp form with the active backend.
+;;   - Page bodies go to a temporary UTF-8 file.  If the call fails, the
+;;     file is kept and its path is logged, so the command can be rerun.
+;;   - =f l= opens the log; ~org-conf-log-enabled~ turns it off and
+;;     ~org-conf-log-max-lines~ caps its size.
 ;;
 ;; Note:
 ;;   Most of the codes in this file are adapted from =ox-html.el=.
@@ -123,6 +134,9 @@
 ;;                 children with `..'/confirm, like file navigation.
 ;;                 Frequent parents come first; URLs only appear in the
 ;;                 manual action.
+;;   - 2026-10-28: Added a background debug log (=*ox-conf-log*/, `f l'):
+;;                 every backend call logs ✅/❌ with timing, CLI commands,
+;;                 elisp reproduction forms, and keeps failed body files.
 
 
 ;;; Code:
@@ -199,6 +213,21 @@ on `exec-path', and falls back to the REST API otherwise."
   :type 'string
   :group 'org-export-conf)
 
+(defcustom org-conf-log-enabled t
+  "When non-nil, ox-conf writes a background debug log."
+  :type 'boolean
+  :group 'org-export-conf)
+
+(defcustom org-conf-log-buffer-name "*ox-conf-log*"
+  "Buffer that receives ox-conf's background debug log."
+  :type 'string
+  :group 'org-export-conf)
+
+(defcustom org-conf-log-max-lines 2000
+  "Maximum number of lines kept in `org-conf-log-buffer-name'."
+  :type 'integer
+  :group 'org-export-conf)
+
 (defconst org-conf--log-level-def
   '(;; debugging
     (blather . 60) (trace . 50) (debug . 40)
@@ -225,6 +254,82 @@ on `exec-path', and falls back to the REST API otherwise."
   "Turn off debug mode."
   (interactive)
   (setq org-conf-log-level -1))
+
+(defun org-conf--log-buffer ()
+  "Return the ox-conf log buffer, creating it if needed."
+  (get-buffer-create org-conf-log-buffer-name))
+
+(defun org-conf-show-log ()
+  "Display the ox-conf background log."
+  (interactive)
+  (pop-to-buffer (org-conf--log-buffer)))
+
+(defun org-conf--log (format-string &rest args)
+  "Append a timestamped line to the ox-conf log and echo it.
+FORMAT-STRING and ARGS are passed to `format'.  Echoing is skipped in
+batch mode; the buffer always receives the line."
+  (when org-conf-log-enabled
+    (let ((line (apply #'format format-string args)))
+      (with-current-buffer (org-conf--log-buffer)
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert (format-time-string "[%H:%M:%S] ") line "\n")
+          (let ((lines (count-lines (point-min) (point-max))))
+            (when (> lines org-conf-log-max-lines)
+              (goto-char (point-min))
+              (forward-line (- lines org-conf-log-max-lines))
+              (delete-region (point-min) (point))))))
+      (unless noninteractive
+        (message "%s" line)))))
+
+(defun org-conf--op-name (op)
+  "Return OP's dispatcher name without the leading colon."
+  (substring (symbol-name op) 1))
+
+(defun org-conf--format-log-arg (arg)
+  "Format ARG for the log; long strings become <N chars>."
+  (if (and (stringp arg) (> (length arg) 120))
+      (format "<%d chars>" (length arg))
+    (prin1-to-string arg)))
+
+(defun org-conf--format-log-args (args)
+  "Format ARGS for the log."
+  (mapconcat #'org-conf--format-log-arg args " "))
+
+(defun org-conf--elisp-command (op args)
+  "Return a copy-pasteable elisp form for OP with ARGS."
+  (format "(let ((org-conf-backend '%s)) (org-conf-backend-%s%s))"
+          (org-conf--active-backend)
+          (org-conf--op-name op)
+          (if args
+              (concat " " (org-conf--format-log-args args))
+            "")))
+
+(defun org-conf--cli-command-string (args)
+  "Return a copy-pasteable confluence command for ARGS."
+  (combine-and-quote-strings
+   (cons (or (ignore-errors (org-conf--cli-program)) org-conf-cli-program)
+         (cons "--json" args))))
+
+(defun org-conf--log-call (op args thunk)
+  "Run THUNK, logging OP with ARGS and its timing.
+On failure, log the reproducible elisp form and re-signal."
+  (let ((start (float-time))
+        (description (if args
+                         (format "%s %s" (org-conf--op-name op)
+                                 (org-conf--format-log-args args))
+                       (org-conf--op-name op))))
+    (condition-case err
+        (let ((result (funcall thunk)))
+          (org-conf--log "✅ %s (%.2fs)" description (- (float-time) start))
+          result)
+      (error
+       (org-conf--log "❌ %s (%.2fs)\n   ELISP (%s): %s\n   %s"
+                      description (- (float-time) start)
+                      (org-conf--active-backend)
+                      (org-conf--elisp-command op args)
+                      (error-message-string err))
+       (signal (car err) (cdr err))))))
 
 (define-skeleton ske-conf
   "Quick insert the required options."
@@ -1463,37 +1568,61 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
 
 (defun org-conf-backend-get-page-info (page-id)
   "Return metadata for PAGE-ID from the active backend."
-  (funcall (org-conf--backend-fn :get-page-info) page-id))
+  (org-conf--log-call
+   :get-page-info (list page-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :get-page-info) page-id))))
 
 (defun org-conf-backend-get-children (page-id)
   "Return PAGE-ID's direct children from the active backend."
-  (funcall (org-conf--backend-fn :get-children) page-id))
+  (org-conf--log-call
+   :get-children (list page-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :get-children) page-id))))
 
 (defun org-conf-backend-get-space-roots (space)
   "Return SPACE's top-level pages from the active backend."
-  (funcall (org-conf--backend-fn :get-space-roots) space))
+  (org-conf--log-call
+   :get-space-roots (list space)
+   (lambda ()
+     (funcall (org-conf--backend-fn :get-space-roots) space))))
 
 (defun org-conf-backend-create-page (title space parent-id)
   "Create a page through the active backend."
-  (funcall (org-conf--backend-fn :create-page) title space parent-id))
+  (org-conf--log-call
+   :create-page (list title space parent-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :create-page) title space parent-id))))
 
 (defun org-conf-backend-update-page (page-id title space body version message)
   "Update PAGE-ID through the active backend."
-  (funcall (org-conf--backend-fn :update-page)
-           page-id title space body version message))
+  (org-conf--log-call
+   :update-page (list page-id title space body version message)
+   (lambda ()
+     (funcall (org-conf--backend-fn :update-page)
+              page-id title space body version message))))
 
 (defun org-conf-backend-list-attachments (page-id)
   "Return PAGE-ID's attachments from the active backend."
-  (funcall (org-conf--backend-fn :list-attachments) page-id))
+  (org-conf--log-call
+   :list-attachments (list page-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :list-attachments) page-id))))
 
 (defun org-conf-backend-search-pages (space query)
   "Return pages in SPACE whose titles match QUERY."
-  (funcall (org-conf--backend-fn :search-pages) space query))
+  (org-conf--log-call
+   :search-pages (list space query)
+   (lambda ()
+     (funcall (org-conf--backend-fn :search-pages) space query))))
 
 (defun org-conf-backend-upload-attachment (page-id filepath &optional attach-id)
   "Upload FILEPATH to PAGE-ID through the active backend."
-  (funcall (org-conf--backend-fn :upload-attachment)
-           page-id filepath attach-id))
+  (org-conf--log-call
+   :upload-attachment (list page-id filepath attach-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :upload-attachment)
+              page-id filepath attach-id))))
 
 (defun org-conf-rest-get-page-info (page-id)
   "Return PAGE-ID's metadata as a plist from the REST API.
@@ -1565,7 +1694,9 @@ when the CLI exits non-zero or prints something that is not JSON."
          (coding-system-for-write 'utf-8-unix)
          (program (org-conf--cli-program))
          (stderr (make-temp-file "ox-conf-cli-err-"))
+         (start (float-time))
          status output)
+    (org-conf--log "   CMD (cli): %s" (org-conf--cli-command-string args))
     (unwind-protect
         (progn
           (with-temp-buffer
@@ -1573,6 +1704,12 @@ when the CLI exits non-zero or prints something that is not JSON."
                                 (list (current-buffer) stderr) nil
                                 "--json" args))
             (setq output (buffer-string)))
+          (if (and (integerp status) (zerop status))
+              (org-conf--log "   ✅ exit=0 (%.2fs)"
+                             (- (float-time) start))
+            (org-conf--log "   ❌ exit=%s (%.2fs)\n   STDERR: %s"
+                           status (- (float-time) start)
+                           (org-conf--cli-error-message stderr)))
           (unless (and (integerp status) (zerop status))
             (user-error "confluence %s failed: %s"
                         (mapconcat #'identity args " ")
@@ -1609,11 +1746,17 @@ transport without redefining `org-conf--cli-json'.")
     file))
 
 (defun org-conf--with-temp-body (text fn)
-  "Call FN with a temporary UTF-8 file holding TEXT, then delete it."
-  (let ((file (org-conf--write-utf8-file text)))
+  "Call FN with a temporary UTF-8 file holding TEXT, then delete it.
+If FN signals, keep the file and log its path so a failed CLI command
+can be rerun."
+  (let ((file (org-conf--write-utf8-file text))
+        (ok nil))
     (unwind-protect
-        (funcall fn file)
-      (delete-file file))))
+        (prog1 (funcall fn file)
+          (setq ok t))
+      (if ok
+          (delete-file file)
+        (org-conf--log "   body kept for debugging: %s" file)))))
 
 ;;; ======================================================================
 ;;;                   confluence-cli Backend Operations
@@ -2138,6 +2281,7 @@ uploaded.  Nothing is written when Confluence refuses the creation."
          (page-id (plist-get created :id)))
     (unless page-id
       (user-error "Confluence did not create the page; the buffer is untouched"))
+    (org-conf--log "✅ created page %s (%s)" title page-id)
     (when parent-id
       (org-conf--freq-save org-conf-parent-freq-file
                            (org-conf--freq-bump
@@ -2165,6 +2309,8 @@ first; see `org-conf-create-page-and-export'."
         (res nil)
         (output nil)
         (org-conf-plist nil))
+    (org-conf--log "✅ backend: %s, page: %s"
+                   (org-conf--active-backend) conf-id)
     (if (eq 'update (org-conf--export-action conf-id))
         (progn
           ;; Update page version number.
@@ -2179,6 +2325,7 @@ first; see `org-conf-create-page-and-export'."
                  `(:org-conf-id ,conf-id)))
           (setq output (org-export-as
                         'org-conf-html subtreep visible-only body-only org-conf-plist))
+          (org-conf--log "✅ export: %d chars" (length output))
           ;; Update the page!
           (setq ver-msg (read-string "Version message: "))
           (org-conf-backend-update-page conf-id title conf-space output version ver-msg))
@@ -2213,6 +2360,7 @@ first; see `org-conf-create-page-and-export'."
                  `(:org-conf-id ,conf-id)))
           (setq output (org-export-as
                         'org-conf-html subtreep visible-only body-only org-conf-plist))
+          (org-conf--log "✅ export: %d chars" (length output))
           ;; Update the page!
           (setq ver-msg (read-string "Version message: "))
           (org-conf-backend-update-page conf-id title conf-space output version ver-msg))
@@ -2286,6 +2434,7 @@ This only affects the REST backend; the CLI manages its own credentials."
       (?w "To Confluence (w/o POST)" org-conf-export-to-conf-without-post)
       (?r "Forget the wrong password" org-conf-forget-password)
       (?o "Open page" org-conf-open-page)
+      (?l "Show debug log" org-conf-show-log)
       ))
   )
 

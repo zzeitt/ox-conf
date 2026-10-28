@@ -18,6 +18,7 @@ Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.o
   - `f w` — export and PUT without uploading images
   - `f r` — clear cached Confluence REST credentials (calls `auth-source-forget-all-cached`); the CLI backend manages its own credentials
   - `f o` — open the Confluence page in the browser (new in 2026-05)
+  - `f l` — show the background debug log
 
 ### Backends (2026-10-24)
 
@@ -29,12 +30,28 @@ Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.o
 - `cli` — always use the `confluence` CLI; it needs a configured profile
   (`confluence profile list`).
 
-The export flow calls seven dispatchers (`org-conf-backend-get-page-info`,
+The export flow calls eight dispatchers (`org-conf-backend-get-page-info`,
 `-get-children`, `-get-space-roots`, `-create-page`, `-update-page`,
-`-list-attachments`, `-upload-attachment`), resolved through
+`-list-attachments`, `-upload-attachment`, `-search-pages`), resolved through
 `org-conf--backend-functions`. The CLI path runs `confluence --json …` via
 `call-process`, sends page bodies through a temporary UTF-8 `--file`, and never
 uses Emacs credentials.
+
+### Debug log (2026-10-28)
+
+Every backend call appends a timestamped `✅`/`❌` line to
+`org-conf-log-buffer-name` (`*ox-conf-log*`), with timing. `f l` opens it.
+CLI calls also log the exact `confluence --json …` command and its exit
+status/stderr; a failed call logs a copy-pasteable elisp form:
+
+```elisp
+(let ((org-conf-backend 'cli))
+  (org-conf-backend-get-page-info "123"))
+```
+
+Page bodies are written to a temporary UTF-8 file; on failure the file is kept
+and its path logged, so the printed `--file` command can be rerun.
+`org-conf-log-enabled` turns the log off; `org-conf-log-max-lines` caps it.
 
 ### Creating a page from scratch (2026-10-10)
 
@@ -92,13 +109,14 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (117 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (126 tests) in `test/ox-conf-test.el`. The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement, the
 drill-down decision table, backend selection and the REST adapters, the CLI
 command lines and error handling, parent-scope inference (common ancestor,
-sibling/recent/title-search fallbacks), recent-parent filtering, and the file-like
-menu (`..`, confirm, recent, children, manual).
+sibling/recent/title-search fallbacks), recent-parent filtering, the file-like
+menu (`..`, confirm, recent, children, manual), and the background log (markers,
+command strings, elisp forms, body retention).
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
 `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
 backend boundaries; the drill-down stubs also assert which menus were shown.
@@ -122,6 +140,9 @@ The entire backend lives in a single file. Its structure:
 - `org-conf-log-level` — controls request logging verbosity (`-1` = silent)
 - `org-conf-backend` — transport: `auto` (default), `rest`, or `cli`
 - `org-conf-cli-program` — executable used by the `cli` backend (default `"confluence"`)
+- `org-conf-log-enabled` — enable the background debug log (default `t`)
+- `org-conf-log-buffer-name` — log buffer (default `"*ox-conf-log*"`)
+- `org-conf-log-max-lines` — cap on retained log lines (default 2000)
 - `org-conf-root-parent-page` — page (URL or id) whose descendants are offered as parent-page choices when creating
 - `org-conf-parent-freq-file` — where parent-page usage counts are persisted
 - `org-conf-parent-max-pages` — cap on pages fetched while listing parent-page choices
@@ -193,6 +214,11 @@ infers the starting page from the local directory, `org-conf--common-ancestor`
 computes the deepest shared ancestor of exported siblings,
 `org-conf--recent-parent-choices` turns the frequency file into `★ 就用 …`
 shortcuts, and `org-conf--drill-choices` builds the file-like menu.
+
+Every dispatcher is wrapped by `org-conf--log-call`, which logs ✅/❌ with
+timing and, on failure, a copy-pasteable elisp form. `org-conf--cli-json` logs
+the exact `confluence --json …` command; `org-conf-show-log` (`f l`) opens the
+buffer.
 
 REST authentication uses HTTP Basic Auth through Emacs' `auth-source`, which caches credentials. `org-conf-forget-password` clears that cache only; the CLI manages its own profile credentials.
 

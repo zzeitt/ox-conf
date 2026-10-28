@@ -1323,4 +1323,117 @@ list of menus that were shown, in order.  The getter is repeatable."
           (should manual))
       (delete-file org-conf-parent-freq-file))))
 
+;;; ----------------------------------------------------------------------
+;;; Background log and reproducible commands.
+;;; ----------------------------------------------------------------------
+
+(ert-deftest ox-conf-test-log-appends-timestamped-lines ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*")
+        (org-conf-log-enabled t))
+    (unwind-protect
+        (progn
+          (with-current-buffer (org-conf--log-buffer) (erase-buffer))
+          (org-conf--log "hello %s" "world")
+          (with-current-buffer (org-conf--log-buffer)
+            (should (string-match-p "\\`\\[[0-9:]+\\] hello world"
+                                    (buffer-string)))))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-log-disabled-writes-nothing ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*")
+        (org-conf-log-enabled nil))
+    (unwind-protect
+        (progn
+          (org-conf--log "nope")
+          (should-not (get-buffer org-conf-log-buffer-name)))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-log-trims-to-max-lines ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*")
+        (org-conf-log-max-lines 3))
+    (unwind-protect
+        (progn
+          (with-current-buffer (org-conf--log-buffer) (erase-buffer))
+          (dotimes (i 5) (org-conf--log "line %d" i))
+          (with-current-buffer (org-conf--log-buffer)
+            (should (= 3 (count-lines (point-min) (point-max))))
+            (should-not (string-match-p "line 0" (buffer-string)))
+            (should (string-match-p "line 4" (buffer-string)))))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-cli-command-string-quotes-arguments ()
+  (let ((org-conf-cli-program "confluence"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_program) "/usr/bin/confluence")))
+      (should (equal "/usr/bin/confluence --json create \"My Doc\" DOCS"
+                     (org-conf--cli-command-string
+                      '("create" "My Doc" "DOCS")))))))
+
+(ert-deftest ox-conf-test-elisp-command-names-the-backend-and-op ()
+  (let ((org-conf-backend 'rest))
+    (should (equal
+             "(let ((org-conf-backend 'rest)) (org-conf-backend-get-page-info \"7\"))"
+             (org-conf--elisp-command :get-page-info '("7"))))))
+
+(ert-deftest ox-conf-test-log-call-reports-success-and-failure ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*"))
+    (unwind-protect
+        (progn
+          (org-conf--log-call :get-page-info '("7") (lambda () 'ok))
+          (should-error (org-conf--log-call :get-page-info '("7")
+                                            (lambda () (user-error "boom"))))
+          (with-current-buffer (org-conf--log-buffer)
+            (should (string-match-p "✅ get-page-info \"7\"" (buffer-string)))
+            (should (string-match-p "❌ get-page-info \"7\"" (buffer-string)))
+            (should (string-match-p "ELISP" (buffer-string)))
+            (should (string-match-p "boom" (buffer-string)))))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-cli-json-logs-the-command ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*")
+        (org-conf-log-enabled t))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (_program) "/usr/bin/confluence"))
+                  ((symbol-function 'call-process)
+                   (lambda (_program _infile dest _display &rest _)
+                     (with-current-buffer (if (consp dest) (car dest) dest)
+                       (insert "{\"id\": \"7\"}"))
+                     0)))
+          (org-conf--cli-json "info" "7")
+          (with-current-buffer (org-conf--log-buffer)
+            (should (string-match-p
+                     "CMD (cli): /usr/bin/confluence --json info 7"
+                     (buffer-string)))
+            (should (string-match-p "✅ exit=0" (buffer-string)))))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-with-temp-body-keeps-the-file-on-error ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*")
+        (path nil))
+    (unwind-protect
+        (progn
+          (should-error
+           (org-conf--with-temp-body
+               "body"
+             (lambda (file) (setq path file) (user-error "boom"))))
+          (should (file-exists-p path)))
+      (when (and path (file-exists-p path)) (delete-file path))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-show-log-opens-the-buffer ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*"))
+    (unwind-protect
+        (progn
+          (org-conf-show-log)
+          (should (equal (buffer-name) org-conf-log-buffer-name)))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
 ;;; ox-conf-test.el ends here
