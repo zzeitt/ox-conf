@@ -1472,6 +1472,7 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-export-to-conf-prompts-before-updating ()
   (let ((prompt nil)
         (updated nil)
+        (export-plist nil)
         (org-conf--skip-upload-confirm nil))
     (with-temp-buffer
       (org-mode)
@@ -1481,14 +1482,17 @@ list of menus that were shown, in order.  The getter is repeatable."
                 ((symbol-function 'y-or-n-p)
                  (lambda (text) (setq prompt text) t))
                 ((symbol-function 'org-export-as)
-                 (lambda (&rest _) "<p>x</p>"))
+                 (lambda (&rest args)
+                   (setq export-plist (nth 4 args))
+                   "<p>x</p>"))
                 ((symbol-function 'read-string) (lambda (&rest _) ""))
                 ((symbol-function 'org-conf-backend-update-page)
                  (lambda (&rest args) (setq updated args))))
         (org-conf-export-to-conf)
         (should (string-match-p "Doc" prompt))
         (should (equal "7" (nth 0 updated)))
-        (should (equal 4 (nth 4 updated)))))))
+        (should (equal 4 (nth 4 updated)))
+        (should (eq t (plist-get export-plist :org-conf-do-post)))))))
 
 (ert-deftest ox-conf-test-export-to-conf-creates-when-declined ()
   (let ((created nil)
@@ -1525,5 +1529,117 @@ list of menus that were shown, in order.  The getter is repeatable."
                  (lambda (&rest args) (setq updated args))))
         (org-conf-export-to-conf)
         (should updated)))))
+
+(ert-deftest ox-conf-test-insert-keywords-keeps-the-old-page-as-a-comment ()
+  "Replacing the page keeps the previous URL as a comment, never as a second ID."
+  (with-temp-buffer
+    (org-mode)
+    (insert (concat "#+TITLE: My Doc\n"
+                    "#+CONF_SPACE: OLD\n"
+                    "#+CONF_PAGE: http://x/old\n"
+                    "#+CONF_ID: 1\n\nBody\n"))
+    (org-conf--insert-conf-keywords "NEW" "http://x/new" "2")
+    (should (equal (concat "#+TITLE: My Doc\n"
+                           "#+CONF_SPACE: NEW\n"
+                           "#+CONF_PAGE: http://x/new\n"
+                           "#+CONF_ID: 2\n"
+                           "# [ox-conf] previous page (kept for reference)\n"
+                           "# #+CONF_SPACE: OLD\n"
+                           "# #+CONF_PAGE: http://x/old\n"
+                           "# #+CONF_ID: 1\n"
+                           "\nBody\n")
+                   (buffer-string)))
+    (should (= 1 (how-many "^#\\+CONF_ID:" (point-min) (point-max))))))
+
+(ert-deftest ox-conf-test-insert-keywords-replaces-the-previous-reference-block ()
+  (with-temp-buffer
+    (org-mode)
+    (insert (concat "#+TITLE: T\n"
+                    "#+CONF_SPACE: A\n"
+                    "#+CONF_PAGE: http://x/a\n"
+                    "#+CONF_ID: 1\n\nBody\n"))
+    (org-conf--insert-conf-keywords "B" "http://x/b" "2")
+    (org-conf--insert-conf-keywords "C" "http://x/c" "3")
+    (should (equal (concat "#+TITLE: T\n"
+                           "#+CONF_SPACE: C\n"
+                           "#+CONF_PAGE: http://x/c\n"
+                           "#+CONF_ID: 3\n"
+                           "# [ox-conf] previous page (kept for reference)\n"
+                           "# #+CONF_SPACE: B\n"
+                           "# #+CONF_PAGE: http://x/b\n"
+                           "# #+CONF_ID: 2\n"
+                           "\nBody\n")
+                   (buffer-string)))
+    (should (= 1 (how-many "previous page" (point-min) (point-max))))))
+
+(ert-deftest ox-conf-test-export-without-post-prompts-and-skips-attachments ()
+  (let ((prompt nil)
+        (updated nil)
+        (export-plist nil)
+        (org-conf--skip-upload-confirm nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                 (lambda (_id) (list :id "7" :title "Doc" :version 3)))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (text) (setq prompt text) t))
+                ((symbol-function 'org-export-as)
+                 (lambda (&rest args)
+                   (setq export-plist (nth 4 args))
+                   "<p>x</p>"))
+                ((symbol-function 'read-string) (lambda (&rest _) ""))
+                ((symbol-function 'org-conf-backend-update-page)
+                 (lambda (&rest args) (setq updated args))))
+        (org-conf-export-to-conf-without-post)
+        (should (string-match-p "Doc" prompt))
+        (should (equal "7" (nth 0 updated)))
+        (should-not (plist-get export-plist :org-conf-do-post))))))
+
+(ert-deftest ox-conf-test-export-without-post-creates-when-declined ()
+  (let ((called nil)
+        (upload 'unset)
+        (org-conf--skip-upload-confirm nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                 (lambda (_id) (list :id "7" :title "Doc" :version 3)))
+                ((symbol-function 'y-or-n-p) (lambda (_text) nil))
+                ((symbol-function 'org-conf-create-page-and-export)
+                 (lambda ()
+                   (setq called t)
+                   (setq upload org-conf--upload-attachments))))
+        (org-conf-export-to-conf-without-post)
+        (should called)
+        (should-not upload)))))
+
+(ert-deftest ox-conf-test-export-without-post-creates-with-no-conf-id ()
+  (let ((called nil)
+        (upload 'unset))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-create-page-and-export)
+                 (lambda ()
+                   (setq called t)
+                   (setq upload org-conf--upload-attachments))))
+        (org-conf-export-to-conf-without-post)
+        (should called)
+        (should-not upload)))))
+
+(ert-deftest ox-conf-test-export-to-conf-creates-with-attachments ()
+  (let ((called nil)
+        (upload 'unset))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-create-page-and-export)
+                 (lambda ()
+                   (setq called t)
+                   (setq upload org-conf--upload-attachments))))
+        (org-conf-export-to-conf)
+        (should called)
+        (should (eq t upload))))))
 
 ;;; ox-conf-test.el ends here

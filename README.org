@@ -133,18 +133,23 @@ Exporting:
   - If the buffer already has ~#+CONF_ID~, ~f f~ asks whether to upload
     to that page (showing its freshly fetched title).  Answering no
     runs the create-page flow instead, leaving the old page alone.
+    ~f f~ and ~f w~ share this confirm/create flow; ~f w~ only skips
+    re-uploading attachments.
   - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
     title, lets you settle on a parent page, creates the page, writes
     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
     matter (after the leading #+ keywords, never above a shebang or
-    mode line), and then uploads the content in one go.
+    mode line), and then uploads the content in one go.  If the file
+    already pointed at a page, that old CONF block is kept below the new
+    one as an org comment (only one active CONF_ID).
 
 Options:
   - ~f b~: "To buffer" org-conf-export-to-buffer
   - ~f p~: "Page info" org-conf-export-page-info
   - ~f i~: "Image info" org-conf-export-img-info
   - ~f f~: "To Confluence" org-conf-export-to-conf
-  - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
+  - ~f w~: "To Confluence (no attachment upload)"
+           org-conf-export-to-conf-without-post
   - ~f r~: "Forget the wrong password" (REST auth cache only)
            org-conf-forget-password
   - ~f l~: "Show debug log" org-conf-show-log
@@ -213,6 +218,9 @@ Change Log:
   - 2026-10-28: =f f= asks before updating an existing page; saying no
                 runs the create-page flow.  The log buffer is a read-only
                 special-mode with Evil/font-lock support.
+  - 2026-10-28: =f f= and =f w= share the same confirm/create flow; =f w=
+                only skips attachment uploads.  Replacing a page keeps
+                the old CONF block as a comment (one active ID).
 
 * Example
 Given this file: =tmp.org=.

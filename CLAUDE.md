@@ -15,7 +15,7 @@ Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.o
   - `f p` — fetch page info (title, version) from Confluence and print it
   - `f i` — list image attachments on the target Confluence page
   - `f f` — full export: if the buffer has `#+CONF_ID`, first asks whether to upload to that page (showing its freshly fetched title); answering no runs the create-page flow. With no `#+CONF_ID`, it creates the page first — see below.
-  - `f w` — export and PUT without uploading images
+  - `f w` — export and PUT without re-uploading attachments; otherwise identical to `f f` (same confirmation/create flow)
   - `f r` — clear cached Confluence REST credentials (calls `auth-source-forget-all-cached`); the CLI backend manages its own credentials
   - `f o` — open the Confluence page in the browser (new in 2026-05)
   - `f l` — show the background debug log
@@ -68,13 +68,19 @@ name) and a parent page, POSTs an empty page, writes
 control), and then calls the normal `org-conf-export-to-conf` flow, so Confluence
 ends up with version 2 holding the real content. The create flow binds
 `org-conf--skip-upload-confirm` so it does not ask again about the page it just
-made.
+made. `f w` runs the same confirm/create flow with
+`org-conf--upload-attachments` nil, so the only difference from `f f` is that
+attachments are not re-uploaded.
 
 The `#+CONF_*` keywords are placed by `org-conf--insert-conf-keywords` at the end of
 the file's leading keyword block, found with `org-conf--keyword-block-end` (org's
 `org-at-keyword-p`). They therefore land *after* `#+TITLE:`/`#+OPTIONS:` rather than
 above them; existing CONF lines are removed first, so a file written by the older
-code gets normalised too. Leading blank lines, a shebang, an Emacs mode line
+code gets normalised too. If the old block pointed at a different page, its
+space/page/id lines are kept below the new block as an org comment
+(`# [ox-conf] previous page (kept for reference)`), so only one active CONF_ID
+remains and the previous page URL is still visible. Leading blank lines, a
+shebang, an Emacs mode line
 (`# -*- … -*-`) and org comments are skipped first by
 `org-conf--front-matter-start`, so the block is never pushed above them. Note that
 ox reads these only as `#+` keywords — `org-export--get-inbuffer-options` ignores
@@ -116,16 +122,17 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (131 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (137 tests) in `test/ox-conf-test.el`. The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
-parsing, the POST payload, BFS collection, shebang-aware keyword placement, the
-drill-down decision table, backend selection and the REST adapters, the CLI
-command lines and error handling, parent-scope inference (common ancestor,
-sibling/recent/title-search fallbacks), recent-parent filtering, the file-like
-menu (`..`, confirm, recent, children, manual), the background log (markers,
-command strings, elisp forms, body retention, read-only special-mode and
-highlighting), and the `f f` upload confirmation (accept, decline-to-create,
-and no re-prompt after creation).
+parsing, the POST payload, BFS collection, shebang-aware keyword placement,
+old-page comment retention, the drill-down decision table, backend selection and
+the REST adapters, the CLI command lines and error handling, parent-scope
+inference (common ancestor, sibling/recent/title-search fallbacks),
+recent-parent filtering, the file-like menu (`..`, confirm, recent, children,
+manual), the background log (markers, command strings, elisp forms, body
+retention, read-only special-mode and highlighting), and the `f f`/`f w` upload
+confirmation (accept, decline-to-create, no re-prompt after creation, and the
+attachment flag).
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
 `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
 backend boundaries; the drill-down stubs also assert which menus were shown.

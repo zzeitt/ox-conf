@@ -64,18 +64,23 @@
 ;;   - If the buffer already has ~#+CONF_ID~, ~f f~ asks whether to upload
 ;;     to that page (showing its freshly fetched title).  Answering no
 ;;     runs the create-page flow instead, leaving the old page alone.
+;;     ~f f~ and ~f w~ share this confirm/create flow; ~f w~ only skips
+;;     re-uploading attachments.
 ;;   - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
 ;;     title, lets you settle on a parent page, creates the page, writes
 ;;     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
 ;;     matter (after the leading #+ keywords, never above a shebang or
-;;     mode line), and then uploads the content in one go.
+;;     mode line), and then uploads the content in one go.  If the file
+;;     already pointed at a page, that old CONF block is kept below the
+;;     new one as an org comment (only one active CONF_ID).
 ;;
 ;; Options:
 ;;   - ~f b~: "To buffer" org-conf-export-to-buffer
 ;;   - ~f p~: "Page info" org-conf-export-page-info
 ;;   - ~f i~: "Image info" org-conf-export-img-info
 ;;   - ~f f~: "To Confluence" org-conf-export-to-conf
-;;   - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
+;;   - ~f w~: "To Confluence (no attachment upload)"
+;;            org-conf-export-to-conf-without-post
 ;;   - ~f r~: "Forget the wrong password" (REST auth cache only)
 ;;            org-conf-forget-password
 ;;   - ~f l~: "Show debug log" org-conf-show-log
@@ -145,6 +150,9 @@
 ;;   - 2026-10-28: `f f' now asks before updating an existing page; saying
 ;;                 no runs the create-page flow.  The log buffer is a
 ;;                 read-only special-mode with Evil/font-lock support.
+;;   - 2026-10-28: `f f' and `f w' share the same confirm/create flow;
+;;                 `f w' only skips attachment uploads.  Replacing a page
+;;                 keeps the old CONF block as a comment (one active ID).
 
 
 ;;; Code:
@@ -1322,16 +1330,41 @@ the front-matter start when the file has no keyword block."
 SPACE, PAGE-URL and ID describe the new page.
 
 Existing CONF_SPACE, CONF_PAGE and CONF_ID lines are removed first, so
-the block never duplicates.  It is then placed at the end of the file's
-leading #+ keyword block -- after #+TITLE: and friends, never above
-them -- in a canonical order."
+the block never duplicates.  If the old block pointed at a different
+page, it is kept below the new block as an org comment for reference;
+only one active CONF_ID ever remains.  The block is placed at the end of
+the file's leading #+ keyword block -- after #+TITLE: and friends, never
+above them -- in a canonical order."
   (save-excursion
-    (goto-char (point-min))
-    (while (re-search-forward "^#\\+CONF_\\(SPACE\\|PAGE\\|ID\\):.*\n?" nil t)
-      (replace-match "" t t))
-    (goto-char (org-conf--keyword-block-end))
-    (insert (format "#+CONF_SPACE: %s\n#+CONF_PAGE: %s\n#+CONF_ID: %s\n"
-                    space page-url id))))
+    (let ((old-block nil)
+          (old-page nil))
+      ;; Capture the old active block before removing it.
+      (goto-char (point-min))
+      (while (re-search-forward "^#\\+CONF_\\(SPACE\\|PAGE\\|ID\\):.*\n?" nil t)
+        (let ((line (string-trim (match-string 0))))
+          (push line old-block)
+          (when (string-prefix-p "#+CONF_PAGE:" line)
+            (setq old-page (string-trim
+                            (substring line (length "#+CONF_PAGE:")))))))
+      (setq old-block (nreverse old-block))
+      ;; Drop any previous reference block so it cannot accumulate.
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^# \\[ox-conf\\] previous page[^\n]*\n\\(?:# #\\+CONF_[^\n]*\n\\)*"
+              nil t)
+        (replace-match "" t t))
+      ;; Remove the old active block.
+      (goto-char (point-min))
+      (while (re-search-forward "^#\\+CONF_\\(SPACE\\|PAGE\\|ID\\):.*\n?" nil t)
+        (replace-match "" t t))
+      ;; Insert the new block, followed by the old page as a comment.
+      (goto-char (org-conf--keyword-block-end))
+      (insert (format "#+CONF_SPACE: %s\n#+CONF_PAGE: %s\n#+CONF_ID: %s\n"
+                      space page-url id))
+      (when (and old-page (not (equal old-page page-url)))
+        (insert "# [ox-conf] previous page (kept for reference)\n")
+        (dolist (line old-block)
+          (insert "# " line "\n"))))))
 
 (defcustom org-conf-parent-root-label "（建在 space 根目录）"
   "The choice that creates a page without a parent page."
@@ -2327,6 +2360,10 @@ a URL can still be typed by hand."
   "Non-nil means `org-conf-export-to-conf' must not ask before uploading.
 Bound to t while the create-page flow uploads the page it just made.")
 
+(defvar org-conf--upload-attachments t
+  "Non-nil means the current export flow uploads page attachments.
+Bound by `org-conf--export-to-conf' for `f f' (t) and `f w' (nil).")
+
 (defun org-conf-create-page-and-export ()
   "Create a Confluence page for the current buffer, then export into it.
 Ask for the target space, title and parent page, POST an empty page,
@@ -2351,14 +2388,15 @@ uploaded.  Nothing is written when Confluence refuses the creation."
       (org-conf--insert-conf-keywords space page-url page-id)
       (message "Created page 「%s」 (%s); uploading content..." title page-id)
       (let ((org-conf--skip-upload-confirm t))
-        (org-conf-export-to-conf)))))
+        (org-conf--export-to-conf
+         org-conf--upload-attachments nil nil nil nil nil)))))
 
-(defun org-conf-export-to-conf
-    (&optional async subtreep visible-only body-only ext-plist)
-  "Export to Confluence through the active backend.
-When the buffer has no #+CONF_ID yet, create a Confluence page for it
-first; see `org-conf-create-page-and-export'."
-  (interactive)
+(defun org-conf--export-to-conf
+    (upload-attachments &optional async subtreep visible-only body-only ext-plist)
+  "Export to Confluence; UPLOAD-ATTACHMENTS controls attachment uploads.
+When the buffer already has #+CONF_ID, ask before updating that page;
+declining runs the create-page flow.  With no #+CONF_ID, create a page
+first."
   ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
   ;; So put it above exporting.
   (let ((conf-id (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-id))
@@ -2370,8 +2408,8 @@ first; see `org-conf-create-page-and-export'."
         (res nil)
         (output nil)
         (org-conf-plist nil))
-    (org-conf--log "✅ backend: %s, page: %s"
-                   (org-conf--active-backend) conf-id)
+    (org-conf--log "✅ backend: %s, page: %s, attachments: %s"
+                   (org-conf--active-backend) conf-id upload-attachments)
     (if (eq 'update (org-conf--export-action conf-id))
         (let* ((info (org-conf--read-or-nil
                       #'org-conf-backend-get-page-info conf-id))
@@ -2382,7 +2420,8 @@ first; see `org-conf-create-page-and-export'."
                          (format "Upload to 「%s」 (%s)? " page-title conf-id))))
               (progn
                 (org-conf--log "↪ new page requested instead of %s" conf-id)
-                (org-conf-create-page-and-export))
+                (let ((org-conf--upload-attachments upload-attachments))
+                  (org-conf-create-page-and-export)))
             (org-conf--log "✅ upload confirmed: %s" page-title)
             ;; Update page version number.
             (setq res info)
@@ -2391,7 +2430,7 @@ first; see `org-conf-create-page-and-export'."
             (setq org-conf-plist
                   (org-combine-plists
                    ext-plist
-                   '(:org-conf-do-post t)
+                   (list :org-conf-do-post upload-attachments)
                    `(:org-conf-user ,user)
                    `(:org-conf-id ,conf-id)))
             (setq output (org-export-as
@@ -2400,42 +2439,24 @@ first; see `org-conf-create-page-and-export'."
             ;; Update the page!
             (setq ver-msg (read-string "Version message: "))
             (org-conf-backend-update-page conf-id title conf-space output version ver-msg)))
-      (org-conf-create-page-and-export))))
+      (let ((org-conf--upload-attachments upload-attachments))
+        (org-conf-create-page-and-export)))))
+
+(defun org-conf-export-to-conf
+    (&optional async subtreep visible-only body-only ext-plist)
+  "Export to Confluence, uploading attachments.
+If the buffer already has #+CONF_ID, ask before updating that page and
+run the create-page flow when declined; otherwise create a page first."
+  (interactive)
+  (org-conf--export-to-conf t async subtreep visible-only body-only ext-plist))
 
 (defun org-conf-export-to-conf-without-post
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export to Confluence through the active backend."
+  "Export to Confluence without re-uploading attachments.
+Otherwise identical to `org-conf-export-to-conf': existing pages are
+confirmed first, and a missing #+CONF_ID creates a new page."
   (interactive)
-  ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
-  ;; So put it above exporting.
-  (let ((conf-id (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-id))
-        (conf-space (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-space))
-        (title (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :title)))
-        (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
-        (version 0)
-        (ver-msg "")
-        (res nil)
-        (output nil)
-        (org-conf-plist nil))
-    (if conf-id
-        (progn
-          ;; Update page version number.
-          (setq res (org-conf-backend-get-page-info conf-id))
-          (setq version (1+ (or (plist-get res :version) 0)))
-          ;; Pass export parameters through communication channel.
-          (setq org-conf-plist
-                (org-combine-plists
-                 ext-plist
-                 '(:org-conf-do-post nil)
-                 `(:org-conf-user ,user)
-                 `(:org-conf-id ,conf-id)))
-          (setq output (org-export-as
-                        'org-conf-html subtreep visible-only body-only org-conf-plist))
-          (org-conf--log "✅ export: %d chars" (length output))
-          ;; Update the page!
-          (setq ver-msg (read-string "Version message: "))
-          (org-conf-backend-update-page conf-id title conf-space output version ver-msg))
-      (message "No CONF_ID found!"))))
+  (org-conf--export-to-conf nil async subtreep visible-only body-only ext-plist))
 
 (defun org-conf-export-to-buffer
     (&optional async subtreep visible-only body-only ext-plist)
@@ -2502,7 +2523,7 @@ This only affects the REST backend; the CLI manages its own credentials."
       (?p "Page info" org-conf-export-page-info)
       (?i "Image info" org-conf-export-img-info)
       (?f "To Confluence (creates page if new)" org-conf-export-to-conf)
-      (?w "To Confluence (w/o POST)" org-conf-export-to-conf-without-post)
+      (?w "To Confluence (no attachment upload)" org-conf-export-to-conf-without-post)
       (?r "Forget the wrong password" org-conf-forget-password)
       (?o "Open page" org-conf-open-page)
       (?l "Show debug log" org-conf-show-log)
