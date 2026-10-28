@@ -1041,6 +1041,7 @@
                     ((symbol-function 'completing-read)
                      ;; Pick the root page rather than "create at space root".
                      (lambda (_prompt collection &rest _) (caadr collection)))
+                    ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                     ((symbol-function 'org-conf-backend-get-page-info)
                      (lambda (id)
                        (if (equal id "999")
@@ -1472,8 +1473,7 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-export-to-conf-prompts-before-updating ()
   (let ((prompt nil)
         (updated nil)
-        (export-plist nil)
-        (org-conf--skip-upload-confirm nil))
+        (export-plist nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1496,8 +1496,7 @@ list of menus that were shown, in order.  The getter is repeatable."
 
 (ert-deftest ox-conf-test-export-to-conf-creates-when-declined ()
   (let ((created nil)
-        (updated nil)
-        (org-conf--skip-upload-confirm nil))
+        (updated nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1512,23 +1511,43 @@ list of menus that were shown, in order.  The getter is repeatable."
         (should created)
         (should-not updated)))))
 
-(ert-deftest ox-conf-test-create-flow-skips-the-upload-confirm ()
-  (let ((org-conf--skip-upload-confirm t)
-        (updated nil))
+(ert-deftest ox-conf-test-create-flow-asks-before-uploading ()
+  (let ((prompt nil)
+        (updated nil)
+        (org-conf--just-created t))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
       (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
                  (lambda (_id) (list :id "7" :title "Doc" :version 3)))
                 ((symbol-function 'y-or-n-p)
-                 (lambda (&rest _) (error "must not prompt")))
+                 (lambda (text) (setq prompt text) t))
                 ((symbol-function 'org-export-as)
                  (lambda (&rest _) "<p>x</p>"))
                 ((symbol-function 'read-string) (lambda (&rest _) ""))
                 ((symbol-function 'org-conf-backend-update-page)
                  (lambda (&rest args) (setq updated args))))
         (org-conf-export-to-conf)
+        (should (string-match-p "Doc" prompt))
         (should updated)))))
+
+(ert-deftest ox-conf-test-declining-the-new-page-does-not-create-another ()
+  (let ((created nil)
+        (updated nil)
+        (org-conf--just-created t))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                 (lambda (_id) (list :id "7" :title "Doc" :version 3)))
+                ((symbol-function 'y-or-n-p) (lambda (_text) nil))
+                ((symbol-function 'org-conf-create-page-and-export)
+                 (lambda () (setq created t)))
+                ((symbol-function 'org-conf-backend-update-page)
+                 (lambda (&rest _) (setq updated t))))
+        (org-conf-export-to-conf)
+        (should-not created)
+        (should-not updated)))))
 
 (ert-deftest ox-conf-test-insert-keywords-keeps-the-old-page-as-a-comment ()
   "Replacing the page keeps the previous URL as a comment, never as a second ID."
@@ -1575,8 +1594,7 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-export-without-post-prompts-and-skips-attachments ()
   (let ((prompt nil)
         (updated nil)
-        (export-plist nil)
-        (org-conf--skip-upload-confirm nil))
+        (export-plist nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1598,8 +1616,7 @@ list of menus that were shown, in order.  The getter is repeatable."
 
 (ert-deftest ox-conf-test-export-without-post-creates-when-declined ()
   (let ((called nil)
-        (upload 'unset)
-        (org-conf--skip-upload-confirm nil))
+        (upload 'unset))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")

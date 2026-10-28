@@ -70,9 +70,10 @@
 ;;     title, lets you settle on a parent page, creates the page, writes
 ;;     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
 ;;     matter (after the leading #+ keywords, never above a shebang or
-;;     mode line), and then uploads the content in one go.  If the file
-;;     already pointed at a page, that old CONF block is kept below the
-;;     new one as an org comment (only one active CONF_ID).
+;;     mode line), and then asks before uploading the content; declining
+;;     leaves the empty page in place.  If the file already pointed at a
+;;     page, that old CONF block is kept below the new one as an org
+;;     comment (only one active CONF_ID).
 ;;
 ;; Options:
 ;;   - ~f b~: "To buffer" org-conf-export-to-buffer
@@ -153,6 +154,8 @@
 ;;   - 2026-10-28: `f f' and `f w' share the same confirm/create flow;
 ;;                 `f w' only skips attachment uploads.  Replacing a page
 ;;                 keeps the old CONF block as a comment (one active ID).
+;;   - 2026-10-28: A newly created page is confirmed before upload too;
+;;                 declining leaves that empty page and stops.
 
 
 ;;; Code:
@@ -2356,9 +2359,10 @@ a URL can still be typed by hand."
                 (org-conf--read-parent-id-manually)
               picked))))))))
 
-(defvar org-conf--skip-upload-confirm nil
-  "Non-nil means `org-conf-export-to-conf' must not ask before uploading.
-Bound to t while the create-page flow uploads the page it just made.")
+(defvar org-conf--just-created nil
+  "Non-nil while the export flow uploads a page it just created.
+If the user declines that upload, the flow stops instead of creating
+another page.")
 
 (defvar org-conf--upload-attachments t
   "Non-nil means the current export flow uploads page attachments.
@@ -2386,8 +2390,8 @@ uploaded.  Nothing is written when Confluence refuses the creation."
                             (org-conf--freq-load org-conf-parent-freq-file))))
     (let ((page-url (org-conf--page-url (plist-get created :webui))))
       (org-conf--insert-conf-keywords space page-url page-id)
-      (message "Created page 「%s」 (%s); uploading content..." title page-id)
-      (let ((org-conf--skip-upload-confirm t))
+      (message "Created page 「%s」 (%s)." title page-id)
+      (let ((org-conf--just-created t))
         (org-conf--export-to-conf
          org-conf--upload-attachments nil nil nil nil nil)))))
 
@@ -2415,13 +2419,18 @@ first."
                       #'org-conf-backend-get-page-info conf-id))
                (page-title (or (plist-get info :title)
                                (format "page %s" conf-id))))
-          (if (and (not org-conf--skip-upload-confirm)
-                   (not (y-or-n-p
-                         (format "Upload to 「%s」 (%s)? " page-title conf-id))))
-              (progn
+          (if (not (y-or-n-p
+                    (format "Upload to 「%s」 (%s)? " page-title conf-id)))
+              (cond
+               (org-conf--just-created
+                (org-conf--log "↪ upload declined for newly created page %s"
+                               conf-id)
+                (message "Page 「%s」 (%s) created but not uploaded; the buffer now points at it."
+                         page-title conf-id))
+               (t
                 (org-conf--log "↪ new page requested instead of %s" conf-id)
                 (let ((org-conf--upload-attachments upload-attachments))
-                  (org-conf-create-page-and-export)))
+                  (org-conf-create-page-and-export))))
             (org-conf--log "✅ upload confirmed: %s" page-title)
             ;; Update page version number.
             (setq res info)

@@ -14,7 +14,7 @@ Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.o
   - `f b` — export to a preview buffer
   - `f p` — fetch page info (title, version) from Confluence and print it
   - `f i` — list image attachments on the target Confluence page
-  - `f f` — full export: if the buffer has `#+CONF_ID`, first asks whether to upload to that page (showing its freshly fetched title); answering no runs the create-page flow. With no `#+CONF_ID`, it creates the page first — see below.
+  - `f f` — full export: if the buffer has `#+CONF_ID`, first asks whether to upload to that page (showing its freshly fetched title); answering no runs the create-page flow, which asks again before uploading the newly created page. With no `#+CONF_ID`, it creates the page first — see below.
   - `f w` — export and PUT without re-uploading attachments; otherwise identical to `f f` (same confirmation/create flow)
   - `f r` — clear cached Confluence REST credentials (calls `auth-source-forget-all-cached`); the CLI backend manages its own credentials
   - `f o` — open the Confluence page in the browser (new in 2026-05)
@@ -66,9 +66,10 @@ for the target space, the page title (defaulting to `#+TITLE:`, then the file
 name) and a parent page, POSTs an empty page, writes
 `#+CONF_SPACE:`/`#+CONF_PAGE:`/`#+CONF_ID:` into the buffer (unsaved — you keep
 control), and then calls the normal `org-conf-export-to-conf` flow, so Confluence
-ends up with version 2 holding the real content. The create flow binds
-`org-conf--skip-upload-confirm` so it does not ask again about the page it just
-made. `f w` runs the same confirm/create flow with
+ends up with version 2 holding the real content. The create flow also asks
+before uploading the page it just made; declining leaves that empty page in
+place and stops (`org-conf--just-created` prevents it from creating another
+page). `f w` runs the same confirm/create flow with
 `org-conf--upload-attachments` nil, so the only difference from `f f` is that
 attachments are not re-uploaded.
 
@@ -122,7 +123,7 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (137 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (138 tests) in `test/ox-conf-test.el`. The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement,
 old-page comment retention, the drill-down decision table, backend selection and
@@ -131,8 +132,8 @@ inference (common ancestor, sibling/recent/title-search fallbacks),
 recent-parent filtering, the file-like menu (`..`, confirm, recent, children,
 manual), the background log (markers, command strings, elisp forms, body
 retention, read-only special-mode and highlighting), and the `f f`/`f w` upload
-confirmation (accept, decline-to-create, no re-prompt after creation, and the
-attachment flag).
+confirmation (accept, decline-to-create, confirmation after creation, declining
+the new page without creating another, and the attachment flag).
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
 `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
 backend boundaries; the drill-down stubs also assert which menus were shown.
