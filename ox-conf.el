@@ -26,33 +26,80 @@
 ;;
 ;; Prerequisites:
 ;;   - Confluene page:
-;;     - Create one conf page on your Confluence cloud side. (Currently
-;;       ox-conf.el doesn't support creating the page from scratch,
-;;       instead it updates an existing page when exporting.)
+;;     - Nothing to prepare by hand: pressing ~f f~ on an org file that
+;;       has no ~#+CONF_ID~ creates the page for you.
 ;;   - Org file:
 ;;     - Add ~#+CONF_ID~ and ~#+CONF_SPACE~ at the top of the .org file
-;;       you want to export.
+;;       you want to export, or let ~f f~ create the page and write them
+;;       for you.
 ;;   - Emacs init:
 ;;     - Install =ox-conf.el=...
 ;;     - Specify ~org-conf-url~ according to your host URL in your init file (e.g. =init.el=).
 ;;     - Specify ~org-conf-jira-chart-server~ according to your case.
 ;;       - Ref: https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html
 ;;     - Specify ~org-conf-jria-chart-server-id~ according to your case.
-;; 
+;;     - Optionally specify ~org-conf-root-parent-page~ (a page URL or
+;;       id): when set, parent pages are picked from that page's
+;;       descendants.  When it is left empty, the picker infers a scope
+;;       from the current file's local directory (the common ancestor of
+;;       nearby exported .org files, then the parent of the most-used
+;;       parent page, then a title match) and starts there.  Menus are
+;;       file-like: `..' goes to the parent page, direct children are
+;;       entered, and `✓ 就用 …' settles on the current page.
+;;       Frequently used parents are offered first.  Candidates show
+;;       titles, never URLs; a URL can still be typed by hand.
+;;     - Choose the transport with ~org-conf-backend~:
+;;         - ~auto~ (default): use the =confluence= CLI when
+;;           ~org-conf-cli-program~ is on ~exec-path~, otherwise the
+;;           REST API;
+;;         - ~rest~: always use the REST API (auth via ~auth-source~);
+;;         - ~cli~: always use the =confluence= CLI, which needs a
+;;           configured profile (see ~confluence profile list~).
+;;       The CLI does not use Emacs credentials, and ~f r~ only clears
+;;       the REST auth cache.
+;;
 ;; Exporting:
 ;;   - Wake up org-export dispatch.
 ;;   - Press ~f f~ for exporting to the CONF_PAGE you provided.
+;;   - If the buffer already has ~#+CONF_ID~, ~f f~ asks whether to upload
+;;     to that page (showing its freshly fetched title).  Answering no
+;;     runs the create-page flow instead, leaving the old page alone.
+;;     ~f f~ and ~f w~ share this confirm/create flow; ~f w~ only skips
+;;     re-uploading attachments.
+;;   - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
+;;     title, lets you settle on a parent page, creates the page, writes
+;;     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
+;;     matter (after the leading #+ keywords, never above a shebang or
+;;     mode line), and then asks before uploading the content; declining
+;;     leaves the empty page in place.  If the file already pointed at a
+;;     page, that old CONF block is kept below the new one as an org
+;;     comment (only one active CONF_ID).
 ;;
 ;; Options:
 ;;   - ~f b~: "To buffer" org-conf-export-to-buffer
 ;;   - ~f p~: "Page info" org-conf-export-page-info
 ;;   - ~f i~: "Image info" org-conf-export-img-info
 ;;   - ~f f~: "To Confluence" org-conf-export-to-conf
-;;   - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
-;;   - ~f r~: "Forget the wrong password" org-conf-forget-password
+;;   - ~f w~: "To Confluence (no attachment upload)"
+;;            org-conf-export-to-conf-without-post
+;;   - ~f r~: "Forget the wrong password" (REST auth cache only)
+;;            org-conf-forget-password
+;;   - ~f l~: "Show debug log" org-conf-show-log
 ;;
 ;; Response:
 ;;   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
+;;
+;; Debug log:
+;;   - Every backend call appends a timestamped `✅'/`❌' line to
+;;     ~org-conf-log-buffer-name~ (default =*ox-conf-log*=), with timing.
+;;     CLI calls also log the exact =confluence --json ...= command; a
+;;     failed call logs a copy-pasteable elisp form with the active backend.
+;;   - Page bodies go to a temporary UTF-8 file.  If the call fails, the
+;;     file is kept and its path is logged, so the command can be rerun.
+;;   - =f l= opens the log; ~org-conf-log-enabled~ turns it off and
+;;     ~org-conf-log-max-lines~ caps its size.  The buffer is a read-only
+;;     =special-mode= (Evil normal state, =q= to quit) with ✅/❌
+;;     highlighting.
 ;;
 ;; Note:
 ;;   Most of the codes in this file are adapted from =ox-html.el=.
@@ -75,12 +122,47 @@
 ;;   - 2025-11-17: Deprecated 'example-block'.
 ;;   - 2025-11-27: Added 'footnote' support.
 ;;   - 2026-05-21: Added 'f o' dispatch action to open conf page.
+;;   - 2026-10-10: 'f f' now creates a Confluence page when the buffer has
+;;                 no #+CONF_ID: it asks for space/title/parent page,
+;;                 POSTs the page, writes the #+CONF_* keywords back, and
+;;                 then runs the normal export.  Parent pages are picked
+;;                 from the descendants of ~org-conf-root-parent-page~,
+;;                 ordered by how often they were chosen before.
+;;   - 2026-10-10: Parent pages are offered by title rather than URL.
+;;                 With no ~org-conf-root-parent-page~, walk the space's
+;;                 tree one level at a time (top-level pages come from
+;;                 /rest/api/space/{key}/content?depth=root).  The
+;;                 CONF_* keywords now join the file's front matter after
+;;                 #+TITLE: instead of being pushed above it.
+;;   - 2026-10-24: Fixed parent-page listing: the space-content endpoint
+;;                 groups results by content type, so `page.results' is
+;;                 now unwrapped and paginated.  CONF_* stays below a
+;;                 leading shebang / mode line.  Added the =confluence=
+;;                 CLI backend behind ~org-conf-backend~ (auto/rest/cli).
+;;   - 2026-10-27: The parent picker infers its scope from the local
+;;                 directory (sibling CONF pages, the parent of the
+;;                 most-used parent, then a title match) and walks direct
+;;                 children with `..'/confirm, like file navigation.
+;;                 Frequent parents come first; URLs only appear in the
+;;                 manual action.
+;;   - 2026-10-28: Added a background debug log (=*ox-conf-log*/, `f l'):
+;;                 every backend call logs ✅/❌ with timing, CLI commands,
+;;                 elisp reproduction forms, and keeps failed body files.
+;;   - 2026-10-28: `f f' now asks before updating an existing page; saying
+;;                 no runs the create-page flow.  The log buffer is a
+;;                 read-only special-mode with Evil/font-lock support.
+;;   - 2026-10-28: `f f' and `f w' share the same confirm/create flow;
+;;                 `f w' only skips attachment uploads.  Replacing a page
+;;                 keeps the old CONF block as a comment (one active ID).
+;;   - 2026-10-28: A newly created page is confirmed before upload too;
+;;                 declining leaves that empty page and stops.
 
 
 ;;; Code:
 
 (require 'ox)
 (require 'request)
+(require 'url-util)
 
 ;;; ======================================================================
 (defcustom org-conf-url
@@ -114,11 +196,14 @@
   :group 'org-export-conf)
 
 (defun org-conf--return-api-url (api)
-  "Borrowed from org-jira/jiralib.el. Given a api path, return the
-full URL with properly concatenated slash '/'."
-  (concat (replace-regexp-in-string "/*$" "/" org-conf-url)
-          (replace-regexp-in-string "^/*" "" api))
-  )
+  "Return the full URL for API.
+API may be a host-relative path, which is joined to `org-conf-url', or
+an absolute URL (Confluence often puts those in `_links.next'), which
+passes through unchanged."
+  (if (string-match-p "\\`https?://" api)
+      api
+    (concat (replace-regexp-in-string "/*$" "/" org-conf-url)
+            (replace-regexp-in-string "^/*" "" api))))
 
 (defcustom org-conf-log-level -1
   "Logging level for request.
@@ -132,6 +217,35 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
                  (const :tag "Level DEBUG" debug)
                  (const :tag "Level TRACE" trace)
                  (const :tag "Level BLATHER" blather)))
+
+(defcustom org-conf-backend 'auto
+  "Which Confluence backend to use.
+`auto' prefers the confluence CLI when `org-conf-cli-program' is found
+on `exec-path', and falls back to the REST API otherwise."
+  :type '(choice (const :tag "Auto (CLI when installed)" auto)
+                 (const :tag "REST API (request.el)" rest)
+                 (const :tag "confluence CLI" cli))
+  :group 'org-export-conf)
+
+(defcustom org-conf-cli-program "confluence"
+  "Executable used by the `cli' backend."
+  :type 'string
+  :group 'org-export-conf)
+
+(defcustom org-conf-log-enabled t
+  "When non-nil, ox-conf writes a background debug log."
+  :type 'boolean
+  :group 'org-export-conf)
+
+(defcustom org-conf-log-buffer-name "*ox-conf-log*"
+  "Buffer that receives ox-conf's background debug log."
+  :type 'string
+  :group 'org-export-conf)
+
+(defcustom org-conf-log-max-lines 2000
+  "Maximum number of lines kept in `org-conf-log-buffer-name'."
+  :type 'integer
+  :group 'org-export-conf)
 
 (defconst org-conf--log-level-def
   '(;; debugging
@@ -159,6 +273,130 @@ One of `error'/`warn'/`info'/`verbose'/`debug'/`trace'/`blather'.
   "Turn off debug mode."
   (interactive)
   (setq org-conf-log-level -1))
+
+(defface org-conf-log-timestamp
+  '((t :foreground "gray50"))
+  "Face for the timestamp at the start of an ox-conf log line."
+  :group 'org-export-conf)
+
+(defface org-conf-log-success
+  '((t :foreground "green"))
+  "Face for successful ox-conf log lines."
+  :group 'org-export-conf)
+
+(defface org-conf-log-error
+  '((t :foreground "red"))
+  "Face for failed ox-conf log lines."
+  :group 'org-export-conf)
+
+(defface org-conf-log-command
+  '((t :foreground "steel blue"))
+  "Face for reproducible commands in the ox-conf log."
+  :group 'org-export-conf)
+
+(defvar org-conf-log-font-lock-keywords
+  '(("^\\[[0-9:]+\\]" 0 'org-conf-log-timestamp)
+    ("✅" 0 'org-conf-log-success)
+    ("❌" 0 'org-conf-log-error)
+    ("^\\s-+CMD\\b.*" 0 'org-conf-log-command)
+    ("^\\s-+ELISP\\b.*" 0 'org-conf-log-command)
+    ("^\\s-+STDERR:.*" 0 'org-conf-log-error))
+  "Font-lock keywords for `org-conf-log-mode'.")
+
+(define-derived-mode org-conf-log-mode special-mode "ox-conf-log"
+  "Major mode for the ox-conf background log.
+Read-only and tail-following like `messages-buffer-mode', with
+success/error/command highlighting."
+  (setq-local window-point-insertion-type t)
+  (setq font-lock-defaults '(org-conf-log-font-lock-keywords t))
+  (font-lock-mode 1))
+
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'org-conf-log-mode 'normal))
+
+(defun org-conf--log-buffer ()
+  "Return the ox-conf log buffer, creating it if needed."
+  (let ((buffer (get-buffer-create org-conf-log-buffer-name)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'org-conf-log-mode)
+        (org-conf-log-mode)))
+    buffer))
+
+(defun org-conf-show-log ()
+  "Display the ox-conf background log."
+  (interactive)
+  (let ((buffer (org-conf--log-buffer)))
+    (with-current-buffer buffer
+      (when (fboundp 'font-lock-ensure)
+        (font-lock-ensure)))
+    (pop-to-buffer buffer)))
+
+(defun org-conf--log (format-string &rest args)
+  "Append a timestamped line to the ox-conf log and echo it.
+FORMAT-STRING and ARGS are passed to `format'.  Echoing is skipped in
+batch mode; the buffer always receives the line."
+  (when org-conf-log-enabled
+    (let ((line (apply #'format format-string args)))
+      (with-current-buffer (org-conf--log-buffer)
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert (format-time-string "[%H:%M:%S] ") line "\n")
+          (let ((lines (count-lines (point-min) (point-max))))
+            (when (> lines org-conf-log-max-lines)
+              (goto-char (point-min))
+              (forward-line (- lines org-conf-log-max-lines))
+              (delete-region (point-min) (point))))))
+      (unless noninteractive
+        (message "%s" line)))))
+
+(defun org-conf--op-name (op)
+  "Return OP's dispatcher name without the leading colon."
+  (substring (symbol-name op) 1))
+
+(defun org-conf--format-log-arg (arg)
+  "Format ARG for the log; long strings become <N chars>."
+  (if (and (stringp arg) (> (length arg) 120))
+      (format "<%d chars>" (length arg))
+    (prin1-to-string arg)))
+
+(defun org-conf--format-log-args (args)
+  "Format ARGS for the log."
+  (mapconcat #'org-conf--format-log-arg args " "))
+
+(defun org-conf--elisp-command (op args)
+  "Return a copy-pasteable elisp form for OP with ARGS."
+  (format "(let ((org-conf-backend '%s)) (org-conf-backend-%s%s))"
+          (org-conf--active-backend)
+          (org-conf--op-name op)
+          (if args
+              (concat " " (org-conf--format-log-args args))
+            "")))
+
+(defun org-conf--cli-command-string (args)
+  "Return a copy-pasteable confluence command for ARGS."
+  (combine-and-quote-strings
+   (cons (or (ignore-errors (org-conf--cli-program)) org-conf-cli-program)
+         (cons "--json" args))))
+
+(defun org-conf--log-call (op args thunk)
+  "Run THUNK, logging OP with ARGS and its timing.
+On failure, log the reproducible elisp form and re-signal."
+  (let ((start (float-time))
+        (description (if args
+                         (format "%s %s" (org-conf--op-name op)
+                                 (org-conf--format-log-args args))
+                       (org-conf--op-name op))))
+    (condition-case err
+        (let ((result (funcall thunk)))
+          (org-conf--log "✅ %s (%.2fs)" description (- (float-time) start))
+          result)
+      (error
+       (org-conf--log "❌ %s (%.2fs)\n   ELISP (%s): %s\n   %s"
+                      description (- (float-time) start)
+                      (org-conf--active-backend)
+                      (org-conf--elisp-command op args)
+                      (error-message-string err))
+       (signal (car err) (cdr err))))))
 
 (define-skeleton ske-conf
   "Quick insert the required options."
@@ -512,7 +750,7 @@ holding contextual information."
 CONTENTS holds the contents of the item.  INFO is a plist holding
 contextual information."
   (let* (
-         (lang (org-element-property :language src-block))
+         (lang (or (org-element-property :language src-block) "none"))
          ;; Extract code and references.
          (code-info (org-export-unravel-code src-block))
          (code (car code-info))
@@ -525,9 +763,9 @@ contextual information."
          (env-comment "")
          )
     ;; Preprocess some parameters.
-    (if (string-match "^%" host)
+    (if (and host (string-match "^%" host))
         (setq host nil))
-    (if (string-match "^%" path)
+    (if (and path (string-match "^%" path))
         (setq path nil))
     (if (string= collapse "t")
         (setq collapse "true")
@@ -797,13 +1035,438 @@ information."
 
 
 ;;; ======================================================================
-;;;                          Request Methods                             
+;;;                          Create-page helpers
+;;; ======================================================================
+
+(defcustom org-conf-root-parent-page ""
+  "Page whose descendants are offered as parent-page choices.
+Either a full Confluence page URL or a bare page id.  When it is empty,
+creating a page asks for a parent page URL instead of offering a list."
+  :type 'string
+  :group 'org-export-conf)
+
+(defcustom org-conf-parent-freq-file
+  (locate-user-emacs-file "ox-conf-parent-freq.eld")
+  "File remembering how often each parent page was chosen.
+Choices are offered most-used first."
+  :type 'file
+  :group 'org-export-conf)
+
+(defcustom org-conf-parent-max-pages 500
+  "Maximum number of pages fetched when listing parent-page choices.
+Guards against a huge space making the prompt take forever."
+  :type 'integer
+  :group 'org-export-conf)
+
+(defcustom org-conf-parent-child-page-limit 200
+  "How many children to request per Confluence page while walking a tree."
+  :type 'integer
+  :group 'org-export-conf)
+
+(defcustom org-conf-scope-search-depth 2
+  "How many directory levels to climb when inferring the parent scope.
+The scope is learned from sibling .org files that already carry
+#+CONF_ID, so a file in a new subdirectory still finds its Confluence
+subtree."
+  :type 'integer
+  :group 'org-export-conf)
+
+(defcustom org-conf-recent-parent-limit 5
+  "How many frequently used parent pages to offer first."
+  :type 'integer
+  :group 'org-export-conf)
+
+(defun org-conf--page-path (node table)
+  "Return NODE's ancestor chain as a \"Root / Mid / Leaf\" string.
+NODE is a plist holding :id, :title and :parent-id.  TABLE maps page
+ids to such plists.  The walk stops at a node with no parent, at an id
+TABLE does not know about, or when a cycle is detected."
+  (let ((titles nil)
+        (cur node)
+        (seen (make-hash-table :test 'equal)))
+    (while (and cur (not (gethash (plist-get cur :id) seen)))
+      (puthash (plist-get cur :id) t seen)
+      (push (plist-get cur :title) titles)
+      (setq cur (gethash (plist-get cur :parent-id) table)))
+    (mapconcat #'identity titles " / ")))
+
+(defun org-conf--sort-parent-candidates (candidates freq)
+  "Sort CANDIDATES by descending usage in FREQ, then by :path.
+CANDIDATES is a list of plists holding at least :id and :path.  FREQ
+is an alist of (PAGE-ID . COUNT); ids missing from it count as zero.
+The input list is not modified."
+  (sort (copy-sequence candidates)
+        (lambda (a b)
+          (let ((fa (or (cdr (assoc (plist-get a :id) freq)) 0))
+                (fb (or (cdr (assoc (plist-get b :id) freq)) 0)))
+            (if (= fa fb)
+                (string-lessp (or (plist-get a :path) "")
+                              (or (plist-get b :path) ""))
+              (> fa fb))))))
+
+(defun org-conf--collect-descendants (root fetch-fn max-nodes)
+  "Return ROOT plus every descendant reachable through FETCH-FN.
+The walk is breadth-first, so near ancestors come before deep ones.
+ROOT is a plist holding :id and :title.  FETCH-FN is called with a page
+id and must return that page's direct children as plists holding :id
+and :title; it may be slow, so it is only called while nodes remain
+under the MAX-NODES budget.
+
+Each node in the result gains a :parent-id and a :path (see
+`org-conf--page-path').  Walking stops silently once MAX-NODES nodes
+have been collected."
+  (let* ((table (make-hash-table :test 'equal))
+         (root-node (list :id (plist-get root :id)
+                          :title (plist-get root :title)
+                          :parent-id (plist-get root :parent-id)))
+         (queue (list root-node))
+         (result nil)
+         (count 0))
+    (puthash (plist-get root-node :id) root-node table)
+    (while (and queue (< count max-nodes))
+      (let* ((node (pop queue))
+             (parent-id (plist-get node :id))
+             (children (funcall fetch-fn parent-id)))
+        (push (plist-put node :path (org-conf--page-path node table)) result)
+        (setq count (1+ count))
+        (dolist (child children)
+          (let ((child-node (list :id (plist-get child :id)
+                                  :title (plist-get child :title)
+                                  :parent-id parent-id)))
+            (puthash (plist-get child-node :id) child-node table)
+            (setq queue (append queue (list child-node)))))))
+    (nreverse result)))
+
+(defconst org-conf--max-child-page-requests 20
+  "Safety cap on pagination, so a broken `next' link cannot loop forever.")
+
+(defun org-conf--child-page-api (page-id)
+  "Return the API path listing PAGE-ID's direct children."
+  (format "/rest/api/content/%s/child/page?limit=%s"
+          page-id org-conf-parent-child-page-limit))
+
+(defun org-conf--space-root-page-api (space)
+  "Return the API path listing SPACE's top-level pages.
+The `depth=root' parameter is what keeps this from walking the whole
+space."
+  (format "/rest/api/space/%s/content?depth=root&limit=%s"
+          space org-conf-parent-child-page-limit))
+
+(defun org-conf--fetch-all-pages (api get-json &optional next-fn)
+  "Return every (:id :title) reachable from API, following `next' links.
+GET-JSON is called with an API path and must return the parsed JSON, or
+nil when the request failed.  At most
+`org-conf--max-child-page-requests' requests are issued.
+
+NEXT-FN, when non-nil, is called with the original API path and the
+next link to produce the next request path; space-root listings use it
+to keep `depth=root' on page two."
+  (let ((json (funcall get-json api))
+        (pages nil)
+        (requests 1))
+    (while (and json (<= requests org-conf--max-child-page-requests))
+      (setq pages (append pages (org-conf--parse-child-page-json json)))
+      (let ((next (org-conf--page-json-next json)))
+        (setq json (and next
+                        (< requests org-conf--max-child-page-requests)
+                        (funcall get-json
+                                 (if next-fn
+                                     (funcall next-fn api next)
+                                   next))))
+        (when json (setq requests (1+ requests)))))
+    pages))
+
+(defun org-conf--fetch-all-children (page-id get-json)
+  "Return PAGE-ID's direct children as a list of (:id :title) plists."
+  (org-conf--fetch-all-pages (org-conf--child-page-api page-id) get-json))
+
+(defun org-conf--fetch-all-space-roots (space get-json)
+  "Return SPACE's top-level pages as a list of (:id :title) plists."
+  (org-conf--fetch-all-pages (org-conf--space-root-page-api space) get-json
+                             #'org-conf--space-root-next))
+
+(defun org-conf--page-json-results (json)
+  "Return the entry alists in JSON.
+Understands both the flat `results' shape used by /child/page and the
+grouped shape used by /space/{key}/content, where the entries live under
+a content-type key such as `page'."
+  (let ((results (or (assoc 'results json)
+                     (assoc 'results (cdr (assoc 'page json))))))
+    (append (cdr results) nil)))
+
+(defun org-conf--page-json-next (json)
+  "Return JSON's next-page link, from the flat or grouped shape."
+  (or (org-conf--json-link json 'next)
+      (org-conf--json-link (cdr (assoc 'page json)) 'next)))
+
+(defun org-conf--query-param (url name)
+  "Return NAME's value from URL's query string, or nil."
+  (when (string-match (format "[?&]%s=\\([^&]*\\)" (regexp-quote name)) url)
+    (match-string 1 url)))
+
+(defun org-conf--space-root-next (api next)
+  "Return the next space-root request after NEXT.
+Confluence's grouped next link points at the per-type endpoint
+\(/space/{key}/content/page), which drops `depth=root' and re-enumerates
+the whole content type.  Rebuild the request from API with NEXT's
+`start' offset so the listing stays root-only."
+  (let ((start (and next (org-conf--query-param next "start"))))
+    (if start
+        (format "%s%cstart=%s" api (if (string-match-p "?" api) ?& ??) start)
+      next)))
+
+(defun org-conf--parse-child-page-json (json)
+  "Turn a child/page JSON response into a list of (:id :title) plists.
+Missing or empty results yield nil.  Space-content responses, which group
+their entries under a content-type key, are unwrapped too."
+  (mapcar (lambda (entry)
+            (list :id (cdr (assoc 'id entry))
+                  :title (cdr (assoc 'title entry))))
+          (org-conf--page-json-results json)))
+
+(defun org-conf--parse-created-page (json)
+  "Turn a POST /rest/api/content response into a (:id :webui) plist.
+:webui is the page's host-relative path, e.g. \"/spaces/DOCS/pages/1/T\"."
+  (list :id (cdr (assoc 'id json))
+        :webui (org-conf--json-link json 'webui)))
+
+(defun org-conf--json-link (json rel)
+  "Return the REL href from JSON's _links object, or nil.
+Confluence puts pagination and page urls there, e.g. `next' and
+`webui'."
+  (cdr (assoc rel (cdr (assoc '_links json)))))
+
+(defun org-conf--post-page-body (title space parent-id)
+  "Build the JSON-encodable payload that creates a Confluence page.
+TITLE and SPACE are strings.  PARENT-ID, when non-nil, nests the new
+page under that page.  The body is deliberately empty: the real content
+is PUT afterwards by the normal export flow.
+
+Note the ancestors value is a vector rather than a list, because
+`json-encode' would otherwise collapse a one-element list into a JSON
+object, and Confluence rejects that."
+  (append
+   `(("type" . "page")
+     ("title" . ,title)
+     ("space" . (("key" . ,space)))
+     ("body" . (("storage" . (("value" . "")
+                              ("representation" . "storage"))))))
+   (when parent-id
+     `(("ancestors" . ,(vector (list (cons "id" parent-id))))))))
+
+(defun org-conf--freq-alist-p (freq)
+  "Non-nil when FREQ looks like an alist of (PAGE-ID . COUNT)."
+  (and (listp freq)
+       (catch 'bad
+         (dolist (cell freq)
+           (unless (and (consp cell)
+                        (stringp (car cell))
+                        (integerp (cdr cell)))
+             (throw 'bad nil)))
+         t)))
+
+(defun org-conf--freq-load (file)
+  "Read the parent-page usage alist from FILE.
+Return nil when FILE is missing, unreadable, or does not hold a valid
+usage alist."
+  (when (file-readable-p file)
+    (condition-case nil
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (let ((data (read (current-buffer))))
+            (when (org-conf--freq-alist-p data) data)))
+      (error nil))))
+
+(defun org-conf--freq-save (file freq)
+  "Write FREQ to FILE as a plain elisp alist, creating directories."
+  (let ((dir (file-name-directory file)))
+    (when dir (make-directory dir t)))
+  (with-temp-file file
+    (let ((print-level nil)
+          (print-length nil))
+      (prin1 freq (current-buffer))
+      (insert "\n"))))
+
+(defun org-conf--freq-bump (id freq)
+  "Return FREQ with ID's usage count increased by one.
+FREQ itself is not modified."
+  (let ((new (copy-alist freq))
+        (cell nil))
+    (if (setq cell (assoc id new))
+        (setcdr cell (1+ (cdr cell)))
+      (push (cons id 1) new))
+    new))
+
+(defconst org-conf--front-matter-comment-regexp
+  "^[ \t]*\\(?:#!\\|# -*-\\|#\\(?:[ \t]\\|$\\)\\)"
+  "A shebang, an Emacs mode line, or an org comment line.")
+
+(defun org-conf--front-matter-start ()
+  "Return the position where the leading #+ keyword block begins.
+Blank lines, shebangs, mode lines and org comments before the block are
+skipped, so nothing is ever inserted above them."
+  (save-excursion
+    (goto-char (point-min))
+    (while (and (not (eobp))
+                (or (looking-at-p "^[ \t]*$")
+                    (looking-at-p org-conf--front-matter-comment-regexp)))
+      (forward-line 1))
+    (point)))
+
+(defun org-conf--keyword-block-end ()
+  "Return the position just after the file's leading #+ keyword block.
+That is where new keywords belong: after #+TITLE: and friends, but
+before any blank line or body text.  Leading shebangs, mode lines and
+org comments are skipped, so the block never starts above them.  Returns
+the front-matter start when the file has no keyword block."
+  (save-excursion
+    (goto-char (org-conf--front-matter-start))
+    (let ((end (point)))
+      (while (and (not (eobp)) (org-at-keyword-p))
+        (forward-line 1)
+        (setq end (point)))
+      end)))
+
+(defun org-conf--insert-conf-keywords (space page-url id)
+  "Write the #+CONF_* keywords for a freshly created page.
+SPACE, PAGE-URL and ID describe the new page.
+
+Existing CONF_SPACE, CONF_PAGE and CONF_ID lines are removed first, so
+the block never duplicates.  If the old block pointed at a different
+page, it is kept below the new block as an org comment for reference;
+only one active CONF_ID ever remains.  The block is placed at the end of
+the file's leading #+ keyword block -- after #+TITLE: and friends, never
+above them -- in a canonical order."
+  (save-excursion
+    (let ((old-block nil)
+          (old-page nil))
+      ;; Capture the old active block before removing it.
+      (goto-char (point-min))
+      (while (re-search-forward "^#\\+CONF_\\(SPACE\\|PAGE\\|ID\\):.*\n?" nil t)
+        (let ((line (string-trim (match-string 0))))
+          (push line old-block)
+          (when (string-prefix-p "#+CONF_PAGE:" line)
+            (setq old-page (string-trim
+                            (substring line (length "#+CONF_PAGE:")))))))
+      (setq old-block (nreverse old-block))
+      ;; Drop any previous reference block so it cannot accumulate.
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^# \\[ox-conf\\] previous page[^\n]*\n\\(?:# #\\+CONF_[^\n]*\n\\)*"
+              nil t)
+        (replace-match "" t t))
+      ;; Remove the old active block.
+      (goto-char (point-min))
+      (while (re-search-forward "^#\\+CONF_\\(SPACE\\|PAGE\\|ID\\):.*\n?" nil t)
+        (replace-match "" t t))
+      ;; Insert the new block, followed by the old page as a comment.
+      (goto-char (org-conf--keyword-block-end))
+      (insert (format "#+CONF_SPACE: %s\n#+CONF_PAGE: %s\n#+CONF_ID: %s\n"
+                      space page-url id))
+      (when (and old-page (not (equal old-page page-url)))
+        (insert "# [ox-conf] previous page (kept for reference)\n")
+        (dolist (line old-block)
+          (insert "# " line "\n"))))))
+
+(defcustom org-conf-parent-root-label "（建在 space 根目录）"
+  "The choice that creates a page without a parent page."
+  :type 'string
+  :group 'org-export-conf)
+
+(defun org-conf--unique-labels (pairs)
+  "Return PAIRS, an alist of (LABEL . ID), with colliding labels made unique.
+A label shared by two or more entries gets its id appended in brackets;
+without that, `completing-read' would return the same string for both
+and the second entry could never be selected."
+  (let ((counts (make-hash-table :test 'equal)))
+    (dolist (pair pairs)
+      (puthash (car pair) (1+ (gethash (car pair) counts 0)) counts))
+    (mapcar (lambda (pair)
+              (if (> (gethash (car pair) counts 1) 1)
+                  (cons (format "%s [%s]" (car pair) (cdr pair)) (cdr pair))
+                pair))
+            pairs)))
+
+(defcustom org-conf-manual-parent-label "（手动输入页面 URL/ID）"
+  "The choice that falls back to typing a parent page URL or id."
+  :type 'string
+  :group 'org-export-conf)
+
+(defconst org-conf--drill-up-label ".."
+  "The choice that climbs to the parent page during drill-down.")
+
+(defun org-conf--drill-confirm-label (title)
+  "Return the drill-down choice that settles on TITLE as the parent page."
+  (format "✓ 就用「%s」作为父页面" title))
+
+(defun org-conf--drill-choices (current children &optional recent)
+  "Build the `completing-read' choices for one drill-down step.
+CURRENT is the page being offered for confirmation, or nil when we are
+at the space top level.  CHILDREN are CURRENT's child pages, which the
+user may descend into.  RECENT are already-built `(use ID)' shortcuts
+for frequently used pages.
+
+Return an alist of (DISPLAY . ACTION).  ACTION is `(root)', `(up)',
+`(manual)', `(confirm ID)', `(use ID)' or `(descend ID)'.  The file-like
+order is `..', the current page, recent pages, direct children, manual."
+  (append
+   (if current
+       (let ((parent-id (plist-get current :parent-id)))
+         (list (cons (if parent-id org-conf--drill-up-label
+                       org-conf-parent-root-label)
+                     (if parent-id '(up) '(root)))
+               (cons (org-conf--drill-confirm-label (plist-get current :title))
+                     (list 'confirm (plist-get current :id)))))
+     (list (cons org-conf-parent-root-label '(root))))
+   recent
+   (mapcar (lambda (pair) (cons (car pair) (list 'descend (cdr pair))))
+           (org-conf--unique-labels
+            (mapcar (lambda (c) (cons (plist-get c :title) (plist-get c :id)))
+                    children)))
+   (list (cons org-conf-manual-parent-label '(manual)))))
+
+(defun org-conf--parent-choices (candidates)
+  "Build `completing-read' choices from CANDIDATES.
+Return an alist of (DISPLAY . PAGE-ID); a nil id means \"create at the
+space root\", which is always offered first."
+  (cons (cons org-conf-parent-root-label nil)
+        (org-conf--unique-labels
+         (mapcar (lambda (c) (cons (plist-get c :path) (plist-get c :id)))
+                 candidates))))
+
+(defun org-conf--export-action (conf-id)
+  "Return `update' when CONF-ID names an existing page, else `create'.
+This is what makes \"f f\" branch between updating and creating."
+  (if conf-id 'update 'create))
+
+(defun org-conf--default-title (org-title file-name)
+  "Pick a page title from ORG-TITLE, the file's #+TITLE, or nil.
+Falls back to the base name of FILE-NAME, then to the empty string.
+A whitespace-only ORG-TITLE counts as absent."
+  (let ((title (and org-title (string-trim org-title))))
+    (or (and title (not (string-empty-p title)) title)
+        (and file-name (file-name-base file-name))
+        "")))
+
+(defun org-conf--page-url (webui)
+  "Expand WEBUI, a page path or an absolute URL, into a full URL.
+Absolute URLs (as returned by the CLI backend) pass through unchanged.
+Returns the empty string when WEBUI is nil, so a missing _links entry
+cannot produce a broken #+CONF_PAGE:."
+  (cond
+   ((not webui) "")
+   ((string-match-p "\\`https?://" webui) webui)
+   (t (org-conf--return-api-url webui))))
+
+;;; ======================================================================
+;;;                          Request Methods
 ;;; ======================================================================
 (defun org-conf-rest-get-page-json (conf-id)
   "Retrieve a Confluence page's status information using GET method."
   (request-response-data
     (request
-      (org-conf--return-api-url (format "/rest/api/content/%s?&expand=version.number" conf-id))
+      (org-conf--return-api-url (format "/rest/api/content/%s?expand=version.number,space,_links,ancestors" conf-id))
       :auth "basic"
       ;; Parser is like the post-process in export backend,
       ;; the data used in "success" function will be processed
@@ -819,6 +1482,60 @@ information."
       :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
                             (message "Got error: %S" error-thrown)))
       )))
+
+(defun org-conf--rest-get-json (api)
+  "GET API and return the parsed JSON, or nil when the request failed."
+  (let ((request-log-level org-conf-log-level)
+        (request-message-level org-conf-log-level))
+    (request-response-data
+     (request
+       (org-conf--return-api-url api)
+       :auth "basic"
+       :parser 'json-read
+       :sync t
+       :timeout 10
+       :success (cl-function
+                 (lambda (&key data &allow-other-keys)
+                   (when data (message "Got %s" api))))
+       :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
+                             (message "Got error: %S" error-thrown)))))))
+
+(defun org-conf-rest-get-page-node (page-id)
+  "Return a (:id :title) plist describing PAGE-ID.
+A nil :title means the page could not be read."
+  (let ((json (org-conf--rest-get-json (format "/rest/api/content/%s" page-id))))
+    (list :id page-id :title (cdr (assoc 'title json)))))
+
+(defun org-conf-rest-get-children (page-id)
+  "Return PAGE-ID's direct children as a list of (:id :title) plists."
+  (org-conf--fetch-all-children page-id #'org-conf--rest-get-json))
+
+(defun org-conf-rest-get-space-roots (space)
+  "Return SPACE's top-level pages as a list of (:id :title) plists."
+  (org-conf--fetch-all-space-roots space #'org-conf--rest-get-json))
+
+(defun org-conf-rest-post-page (title space parent-id)
+  "Create a page titled TITLE in SPACE under PARENT-ID.
+PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
+:id means Confluence refused to create the page."
+  (let ((request-log-level org-conf-log-level)
+        (request-message-level org-conf-log-level))
+    (org-conf--parse-created-page
+     (request-response-data
+      (request
+        (org-conf--return-api-url "/rest/api/content")
+        :auth "basic"
+        :type "POST"
+        :data (json-encode (org-conf--post-page-body title space parent-id))
+        :headers '(("Content-Type" . "application/json"))
+        :parser 'json-read
+        :sync t
+        :timeout 10
+        :success (cl-function
+                  (lambda (&key data &allow-other-keys)
+                    (when data (message "Created page!"))))
+        :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
+                              (message "Got error: %S" error-thrown))))))))
 
 (defun org-conf-rest-put (conf-id title conf-space body version ver-msg)
   (let* ((request-log-level org-conf-log-level)
@@ -901,21 +1618,348 @@ information."
     )
   )
 
+;;; ======================================================================
+;;;                          Backend Dispatch
+;;; ======================================================================
+(defun org-conf--active-backend ()
+  "Return the backend to use: `rest' or `cli'.
+`auto' prefers the CLI when `org-conf-cli-program' is on `exec-path'."
+  (pcase org-conf-backend
+    ('cli 'cli)
+    ('rest 'rest)
+    ('auto (if (executable-find org-conf-cli-program) 'cli 'rest))
+    (_ (user-error "Unknown `org-conf-backend': %S" org-conf-backend))))
+
+(defvar org-conf--backend-functions
+  '((rest
+     (:get-page-info . org-conf-rest-get-page-info)
+     (:get-children . org-conf-rest-get-children)
+     (:get-space-roots . org-conf-rest-get-space-roots)
+     (:create-page . org-conf-rest-post-page)
+     (:update-page . org-conf-rest-put)
+     (:list-attachments . org-conf-rest-list-attachments)
+     (:upload-attachment . org-conf-rest-post-file)
+     (:search-pages . org-conf-rest-search-pages))
+    (cli
+     (:get-page-info . org-conf-cli-get-page-info)
+     (:get-children . org-conf-cli-get-children)
+     (:get-space-roots . org-conf-cli-get-space-roots)
+     (:create-page . org-conf-cli-create-page)
+     (:update-page . org-conf-cli-update-page)
+     (:list-attachments . org-conf-cli-list-attachments)
+     (:upload-attachment . org-conf-cli-upload-attachment)
+     (:search-pages . org-conf-cli-search-pages)))
+  "Backend implementations, as an alist of BACKEND . ((OP . FUNCTION) ...).")
+
+(defun org-conf--backend-fn (op)
+  "Return the function implementing OP for the active backend."
+  (or (cdr (assq op (alist-get (org-conf--active-backend)
+                               org-conf--backend-functions)))
+      (user-error "Backend %s does not implement %s"
+                  (org-conf--active-backend) op)))
+
+(defun org-conf-backend-get-page-info (page-id)
+  "Return metadata for PAGE-ID from the active backend."
+  (org-conf--log-call
+   :get-page-info (list page-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :get-page-info) page-id))))
+
+(defun org-conf-backend-get-children (page-id)
+  "Return PAGE-ID's direct children from the active backend."
+  (org-conf--log-call
+   :get-children (list page-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :get-children) page-id))))
+
+(defun org-conf-backend-get-space-roots (space)
+  "Return SPACE's top-level pages from the active backend."
+  (org-conf--log-call
+   :get-space-roots (list space)
+   (lambda ()
+     (funcall (org-conf--backend-fn :get-space-roots) space))))
+
+(defun org-conf-backend-create-page (title space parent-id)
+  "Create a page through the active backend."
+  (org-conf--log-call
+   :create-page (list title space parent-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :create-page) title space parent-id))))
+
+(defun org-conf-backend-update-page (page-id title space body version message)
+  "Update PAGE-ID through the active backend."
+  (org-conf--log-call
+   :update-page (list page-id title space body version message)
+   (lambda ()
+     (funcall (org-conf--backend-fn :update-page)
+              page-id title space body version message))))
+
+(defun org-conf-backend-list-attachments (page-id)
+  "Return PAGE-ID's attachments from the active backend."
+  (org-conf--log-call
+   :list-attachments (list page-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :list-attachments) page-id))))
+
+(defun org-conf-backend-search-pages (space query)
+  "Return pages in SPACE whose titles match QUERY."
+  (org-conf--log-call
+   :search-pages (list space query)
+   (lambda ()
+     (funcall (org-conf--backend-fn :search-pages) space query))))
+
+(defun org-conf-backend-upload-attachment (page-id filepath &optional attach-id)
+  "Upload FILEPATH to PAGE-ID through the active backend."
+  (org-conf--log-call
+   :upload-attachment (list page-id filepath attach-id)
+   (lambda ()
+     (funcall (org-conf--backend-fn :upload-attachment)
+              page-id filepath attach-id))))
+
+(defun org-conf-rest-get-page-info (page-id)
+  "Return PAGE-ID's metadata as a plist from the REST API.
+Keys: :id, :title, :version, :space, :parent-id, :ancestors and :url.
+:ancestors is the root-first chain of (:id :title) plists above the page."
+  (let ((json (org-conf-rest-get-page-json page-id)))
+    (when json
+      (let* ((raw-ancestors (append (cdr (assoc 'ancestors json)) nil))
+             (ancestors (mapcar (lambda (ancestor)
+                                  (list :id (cdr (assoc 'id ancestor))
+                                        :title (cdr (assoc 'title ancestor))))
+                                raw-ancestors)))
+        (list :id (or (cdr (assoc 'id json)) page-id)
+              :title (cdr (assoc 'title json))
+              :version (cdr (assoc 'number (assoc 'version json)))
+              :space (cdr (assoc 'key (assoc 'space json)))
+              :parent-id (cdr (assoc 'id (car (last raw-ancestors))))
+              :ancestors ancestors
+              :url (org-conf--page-url (org-conf--json-link json 'webui)))))))
+
+(defun org-conf-rest-list-attachments (page-id)
+  "Return PAGE-ID's attachments as (:id :title) plists from the REST API."
+  (mapcar (lambda (attachment)
+            (list :id (plist-get attachment :id)
+                  :title (plist-get attachment :title)))
+          (append (plist-get (org-conf-rest-get-attach-json page-id) :results)
+                  nil)))
+
+(defun org-conf-rest-search-pages (space query)
+  "Return pages in SPACE whose title matches QUERY, via CQL."
+  (let* ((cql (format "title ~ \"%s\" and space = \"%s\"" query space))
+         (json (org-conf--rest-get-json
+                (format "/rest/api/content/search?cql=%s&limit=%s"
+                        (url-hexify-string cql)
+                        org-conf-parent-child-page-limit))))
+    (mapcar (lambda (result)
+              (list :id (cdr (assoc 'id result))
+                    :title (cdr (assoc 'title result))
+                    :type (cdr (assoc 'type result))))
+            (append (cdr (assoc 'results json)) nil))))
+
+;;; ======================================================================
+;;;                     confluence-cli Process Layer
+;;; ======================================================================
+(defun org-conf--cli-program ()
+  "Return the absolute path of `org-conf-cli-program'."
+  (or (executable-find org-conf-cli-program)
+      (user-error "Confluence CLI not found: %s (set `org-conf-cli-program')"
+                  org-conf-cli-program)))
+
+(defun org-conf--cli-error-message (stderr-file)
+  "Return the message in STDERR-FILE, preferring the CLI's JSON `error'."
+  (let ((text (when (file-readable-p stderr-file)
+                (with-temp-buffer
+                  (insert-file-contents stderr-file)
+                  (string-trim (buffer-string))))))
+    (if (string-empty-p (or text ""))
+        "no error output"
+      (or (ignore-errors
+            (alist-get 'error
+                       (json-parse-string text :object-type 'alist)))
+          text))))
+
+(defun org-conf--cli-json (&rest args)
+  "Run the confluence CLI with ARGS and return the parsed JSON.
+The global `--json' flag is prepended to ARGS.  Signals `user-error'
+when the CLI exits non-zero or prints something that is not JSON."
+  (let* ((coding-system-for-read 'utf-8-unix)
+         (coding-system-for-write 'utf-8-unix)
+         (program (org-conf--cli-program))
+         (stderr (make-temp-file "ox-conf-cli-err-"))
+         (start (float-time))
+         status output)
+    (org-conf--log "   CMD (cli): %s" (org-conf--cli-command-string args))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (setq status (apply #'call-process program nil
+                                (list (current-buffer) stderr) nil
+                                "--json" args))
+            (setq output (buffer-string)))
+          (if (and (integerp status) (zerop status))
+              (org-conf--log "   ✅ exit=0 (%.2fs)"
+                             (- (float-time) start))
+            (org-conf--log "   ❌ exit=%s (%.2fs)\n   STDERR: %s"
+                           status (- (float-time) start)
+                           (org-conf--cli-error-message stderr)))
+          (unless (and (integerp status) (zerop status))
+            (user-error "confluence %s failed: %s"
+                        (mapconcat #'identity args " ")
+                        (org-conf--cli-error-message stderr)))
+          (condition-case err
+              (with-temp-buffer
+                (insert output)
+                (goto-char (point-min))
+                (json-parse-buffer :object-type 'alist
+                                   :array-type 'list
+                                   :null-object nil
+                                   :false-object nil))
+            (error
+             (user-error "confluence %s returned invalid JSON: %s"
+                         (mapconcat #'identity args " ")
+                         (error-message-string err)))))
+      (delete-file stderr))))
+
+(defvar org-conf--cli-json-function #'org-conf--cli-json
+  "Function used to run the CLI and parse its JSON.
+Rebind this (in tests or an alternative front end) to replace the
+transport without redefining `org-conf--cli-json'.")
+
+(defun org-conf--cli-invoke (&rest args)
+  "Call `org-conf--cli-json-function' with ARGS."
+  (apply org-conf--cli-json-function args))
+
+(defun org-conf--write-utf8-file (text)
+  "Write TEXT to a fresh UTF-8 temporary file and return its name."
+  (let ((file (make-temp-file "ox-conf-body-" nil ".html"))
+        (coding-system-for-write 'utf-8-unix))
+    (with-temp-file file
+      (insert text))
+    file))
+
+(defun org-conf--with-temp-body (text fn)
+  "Call FN with a temporary UTF-8 file holding TEXT, then delete it.
+If FN signals, keep the file and log its path so a failed CLI command
+can be rerun."
+  (let ((file (org-conf--write-utf8-file text))
+        (ok nil))
+    (unwind-protect
+        (prog1 (funcall fn file)
+          (setq ok t))
+      (if ok
+          (delete-file file)
+        (org-conf--log "   body kept for debugging: %s" file)))))
+
+;;; ======================================================================
+;;;                   confluence-cli Backend Operations
+;;; ======================================================================
+(defun org-conf--cli-api-path (api)
+  "Turn a REST API path into one relative to the CLI's `apiPath'."
+  (replace-regexp-in-string "\\`/*\\(?:rest/api/\\)?" "" api))
+
+(defun org-conf-cli-get-page-info (page-id)
+  "Return PAGE-ID's metadata as a plist from the confluence CLI.
+Keys: :id, :title, :version, :space, :parent-id, :ancestors and :url."
+  (let* ((json (org-conf--cli-invoke "info" page-id))
+         (ancestors (mapcar (lambda (ancestor)
+                              (list :id (alist-get 'id ancestor)
+                                    :title (alist-get 'title ancestor)))
+                            (alist-get 'ancestors json))))
+    (list :id (alist-get 'id json)
+          :title (alist-get 'title json)
+          :version (alist-get 'version json)
+          :space (alist-get 'spaceKey json)
+          :parent-id (alist-get 'parentId json)
+          :ancestors ancestors
+          :url (alist-get 'url json))))
+
+(defun org-conf-cli-get-children (page-id)
+  "Return PAGE-ID's direct children as (:id :title) plists."
+  (mapcar (lambda (child)
+            (list :id (alist-get 'id child)
+                  :title (alist-get 'title child)))
+          (alist-get 'children (org-conf--cli-invoke "children" page-id))))
+
+(defun org-conf-cli-get-space-roots (space)
+  "Return SPACE's top-level pages as (:id :title) plists."
+  (let* ((base (org-conf--cli-api-path (org-conf--space-root-page-api space)))
+         (api base)
+         (pages nil)
+         (requests 0))
+    (while (and api (< requests org-conf--max-child-page-requests))
+      (let ((json (org-conf--cli-invoke "api" api)))
+        (setq pages (append pages (org-conf--parse-child-page-json json)))
+        (setq api (org-conf--space-root-next base (org-conf--page-json-next json)))
+        (setq requests (1+ requests))))
+    pages))
+
+(defun org-conf-cli-create-page (title space parent-id)
+  "Create a page titled TITLE in SPACE under PARENT-ID through the CLI.
+Return a (:id :webui) plist; :webui is the CLI's absolute page URL."
+  (let ((json (org-conf--with-temp-body
+                  ""
+                (lambda (file)
+                  (if parent-id
+                      (org-conf--cli-invoke "create-child" title parent-id
+                                            "--file" file)
+                    (org-conf--cli-invoke "create" title space "--file" file))))))
+    (list :id (alist-get 'id json)
+          :webui (alist-get 'url json))))
+
+(defun org-conf-cli-update-page (page-id title space body version message)
+  "Update PAGE-ID through the CLI.
+SPACE, VERSION and MESSAGE are accepted for interface compatibility and
+ignored: the CLI fetches the current version itself."
+  (org-conf--with-temp-body
+      body
+    (lambda (file)
+      (apply #'org-conf--cli-invoke
+             (append (list "update" page-id)
+                     (unless (string-empty-p (or title ""))
+                       (list "--title" title))
+                     (list "--file" file "--format" "storage"))))))
+
+(defun org-conf-cli-list-attachments (page-id)
+  "Return PAGE-ID's attachments as (:id :title) plists from the CLI."
+  (mapcar (lambda (attachment)
+            (list :id (alist-get 'id attachment)
+                  :title (alist-get 'title attachment)))
+          (alist-get 'attachments (org-conf--cli-invoke "attachments" page-id))))
+
+(defun org-conf-cli-search-pages (space query)
+  "Return pages in SPACE whose title matches QUERY, via the CLI."
+  (let ((cql (format "title ~ \"%s\" and space = \"%s\"" query space)))
+    (mapcar (lambda (result)
+              (list :id (alist-get 'id result)
+                    :title (alist-get 'title result)
+                    :type (alist-get 'type result)))
+            (alist-get 'results
+                       (org-conf--cli-invoke
+                        "search" cql "--cql"
+                        "--limit" (number-to-string
+                                   org-conf-parent-child-page-limit))))))
+
+(defun org-conf-cli-upload-attachment (page-id filepath &optional attach-id)
+  "Upload FILEPATH to PAGE-ID through the CLI.
+ATTACH-ID only signals that an existing attachment should be replaced."
+  (apply #'org-conf--cli-invoke
+         (append (list "attachment-upload" page-id "--file" filepath)
+                 (when attach-id (list "--replace")))))
+
 (defun org-conf--upload-img (conf-id link)
   "Given image file or attachment's path LINK, upload it to conf page with CONF-ID.
-@done: Ask for replace or not if image exists."
-  (let* ((attach-json (org-conf-rest-get-attach-json conf-id))
+Ask for confirmation when an attachment with the same name exists."
+  (let* ((attachments (org-conf-backend-list-attachments conf-id))
          (filename (file-name-nondirectory link))
-         (attach-id (org-conf--parse-attach-json
-                     attach-json filename)))
+         (attach-id (plist-get (seq-find
+                                (lambda (attachment)
+                                  (equal filename (plist-get attachment :title)))
+                                attachments)
+                               :id)))
     (if attach-id
-        ;; Existed attachment will be asked first
-        (if (y-or-n-p (format "Attachment '%s' already exists, replace?" filename))
-            (org-conf-rest-post-file conf-id link attach-id))
-      ;; New attatchment will be uploaded
-      (org-conf-rest-post-file conf-id link attach-id)
-      )
-    ))
+        (when (y-or-n-p (format "Attachment '%s' already exists, replace?" filename))
+          (org-conf-backend-upload-attachment conf-id link attach-id))
+      (org-conf-backend-upload-attachment conf-id link nil))))
 
 
 ;;; ======================================================================
@@ -956,9 +2000,9 @@ information."
         (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
         (res nil))
     (if conf-id
-        (progn
-          (setq res (org-conf-rest-get-page-json conf-id))
-          (org-conf-page-json-parser res))
+        (let ((info (org-conf-backend-get-page-info conf-id)))
+          (message "===> Title is: %s, version is: %s"
+                   (plist-get info :title) (plist-get info :version)))
       (message "No CONF_ID found!"))))
 
 (defun org-conf-export-img-info
@@ -971,78 +2015,457 @@ information."
         (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
         (res nil))
     (if conf-id
-        (progn
-          (setq res (org-conf-rest-get-attach-json conf-id))
-          (org-conf--parse-attach-json res))
+        (dolist (attachment (org-conf-backend-list-attachments conf-id))
+          (message "===> Image info: title is %s, ID is %s."
+                   (plist-get attachment :title)
+                   (plist-get attachment :id)))
       (message "No CONF_ID found!"))))
+
+(defun org-conf--read-space ()
+  "Prompt for a Confluence space key, defaulting to `org-conf-default-space'."
+  (let ((space (string-trim (read-string "Confluence space: "
+                                         org-conf-default-space))))
+    (if (string-empty-p space)
+        (user-error "A Confluence space key is required")
+      space)))
+
+(defun org-conf--read-title ()
+  "Prompt for the new page's title.
+Defaults to the buffer's #+TITLE, then to its file name."
+  (let* ((info (org-export--get-inbuffer-options 'org-conf-html))
+         (default (org-conf--default-title
+                   (car (plist-get info :title))
+                   (buffer-file-name)))
+         (title (string-trim (read-string "Page title: " default))))
+    (if (string-empty-p title)
+        (user-error "A page title is required")
+      title)))
+
+(defun org-conf--read-parent-id-manually ()
+  "Ask for a parent page URL or id.
+Return nil when the answer is blank, meaning the space root."
+  (let ((typed (string-trim
+                (read-string "Parent page URL/ID (blank = space root): "))))
+    (if (string-empty-p typed)
+        nil
+      (or (org-conf--return-id-from-url typed)
+          (user-error "No page id found in %s" typed)))))
+
+(defun org-conf--read-or-nil (function &rest args)
+  "Call FUNCTION with ARGS, returning nil and messaging on backend failure.
+Only `user-error' is caught: the REST backend already returns nil on a
+failed read, while the CLI backend raises."
+  (condition-case err
+      (apply function args)
+    (user-error
+     (message "%s" (error-message-string err))
+     nil)))
+
+(defvar org-conf--page-info-cache (make-hash-table :test 'equal)
+  "Session cache of page metadata, keyed by page id.")
+
+(defvar org-conf--scope-cache (make-hash-table :test 'equal)
+  "Session cache of inferred parent scopes, keyed by DIRECTORY\\0SPACE.")
+
+(defun org-conf--cached-page-info (page-id)
+  "Return PAGE-ID's metadata, caching successful reads for this session."
+  (let ((cached (gethash page-id org-conf--page-info-cache 'miss)))
+    (if (not (eq cached 'miss))
+        cached
+      (let ((info (org-conf--read-or-nil #'org-conf-backend-get-page-info page-id)))
+        (when info
+          (puthash page-id info org-conf--page-info-cache))
+        info))))
+
+(defun org-conf--common-prefix (a b)
+  "Return the common prefix of ancestor lists A and B."
+  (let ((prefix nil))
+    (while (and a b (equal (plist-get (car a) :id)
+                           (plist-get (car b) :id)))
+      (push (car a) prefix)
+      (setq a (cdr a)
+            b (cdr b)))
+    (nreverse prefix)))
+
+(defun org-conf--common-ancestor (chains)
+  "Return the deepest plist shared by all CHAINS, or nil.
+Each CHAIN is a root-first list of (:id :title) plists."
+  (let ((chains (delq nil (mapcar (lambda (chain)
+                                    (and chain (append chain nil)))
+                                  chains))))
+    (when chains
+      (let ((prefix (car chains)))
+        (dolist (chain (cdr chains))
+          (setq prefix (org-conf--common-prefix prefix chain)))
+        (car (last prefix))))))
+
+(defun org-conf--parent-directory (dir)
+  "Return DIR's parent directory, or nil at the filesystem root."
+  (let* ((expanded (expand-file-name dir))
+         (parent (file-name-directory (directory-file-name expanded))))
+    (unless (equal parent expanded)
+      parent)))
+
+(defun org-conf--org-files-near (dir)
+  "Return .org files in DIR and its immediate subdirectories."
+  (append (directory-files dir t "\\.org\\'" t)
+          (cl-loop for sub in (directory-files dir t "\\`[^.]" t)
+                   when (file-directory-p sub)
+                   append (directory-files sub t "\\.org\\'" t))))
+
+(defun org-conf--conf-ids-in-directory (dir space)
+  "Return up to 8 page ids from .org files near DIR whose CONF_SPACE is SPACE.
+\"Near\" means DIR itself and its immediate subdirectories, so a topic
+directory learns from its sibling topic directories.  The current
+buffer's file is skipped."
+  (let ((current (and buffer-file-name
+                      (ignore-errors (file-truename buffer-file-name))))
+        (ids nil)
+        (count 0))
+    (when (file-directory-p dir)
+      (dolist (file (org-conf--org-files-near dir))
+        (when (and (< count 8)
+                   (not (equal (ignore-errors (file-truename file)) current)))
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (let ((file-space
+                   (when (re-search-forward
+                          "^#\\+CONF_SPACE:[ \t]*\\([^ \t\n]+\\)" nil t)
+                     (match-string 1))))
+              (when (equal space file-space)
+                (goto-char (point-min))
+                (when (re-search-forward
+                       "^#\\+CONF_ID:[ \t]*\\([^ \t\n]+\\)" nil t)
+                  (push (match-string 1) ids)
+                  (setq count (1+ count)))))))))
+    (nreverse ids)))
+
+(defun org-conf--name-matched-scope (space dir)
+  "Find a page in SPACE whose title best matches DIR's name.
+The shortest matching title wins, so `vml' prefers `HygonVML' over
+`HygonVML算法记录'.  Attachments and other non-page results are ignored."
+  (let* ((name (file-name-nondirectory (directory-file-name dir)))
+         (needle (downcase name))
+         (results (org-conf--read-or-nil #'org-conf-backend-search-pages
+                                         space name))
+         (matches (seq-filter
+                   (lambda (page)
+                     (and (or (null (plist-get page :type))
+                              (equal "page" (plist-get page :type)))
+                          (string-match-p
+                           (regexp-quote needle)
+                           (downcase (or (plist-get page :title) "")))))
+                   results))
+         (best (car (sort (copy-sequence matches)
+                          (lambda (a b)
+                            (< (length (plist-get a :title))
+                               (length (plist-get b :title))))))))
+    (when best
+      (org-conf--cached-page-info (plist-get best :id)))))
+
+(defun org-conf--scope-in-directory (dir space)
+  "Return the common ancestor page of DIR's exported .org files."
+  (let ((ancestor (org-conf--common-ancestor
+                   (delq nil
+                         (mapcar (lambda (id)
+                                   (plist-get (org-conf--cached-page-info id)
+                                              :ancestors))
+                                 (org-conf--conf-ids-in-directory dir space))))))
+    (when ancestor
+      (org-conf--cached-page-info (plist-get ancestor :id)))))
+
+(defun org-conf--recent-parent-scope (space)
+  "Return the parent of the most-used parent page in SPACE, if any.
+This turns recently used parents into a starting point for the picker."
+  (let ((freq (sort (copy-sequence
+                     (org-conf--freq-load org-conf-parent-freq-file))
+                    (lambda (a b) (> (cdr a) (cdr b)))))
+        (scope nil)
+        (tried 0))
+    (while (and freq (not scope) (< tried 5))
+      (let ((info (org-conf--cached-page-info (caar freq))))
+        (setq tried (1+ tried))
+        (when (and info (equal space (plist-get info :space)))
+          (let ((parent-id (plist-get info :parent-id)))
+            (setq scope
+                  (if parent-id
+                      (let ((parent (org-conf--cached-page-info parent-id)))
+                        (and parent
+                             (equal space (plist-get parent :space))
+                             parent))
+                    info)))))
+      (setq freq (cdr freq)))
+    scope))
+
+(defun org-conf--infer-parent-scope-uncached (space start)
+  "Infer a parent scope for SPACE starting at directory START.
+Prefer the current directory's exported siblings, then the parent of
+the most-used recent parent, then one or two directories up, then a
+title match on the directory name."
+  (let ((scope (org-conf--scope-in-directory start space))
+        (dir (org-conf--parent-directory start))
+        (depth 1))
+    (unless scope
+      (setq scope (org-conf--recent-parent-scope space)))
+    (while (and dir (not scope) (<= depth org-conf-scope-search-depth))
+      (setq scope (org-conf--scope-in-directory dir space))
+      (setq depth (1+ depth))
+      (unless scope
+        (setq dir (org-conf--parent-directory dir))))
+    (or scope
+        (org-conf--name-matched-scope space start))))
+
+(defun org-conf--infer-parent-scope (space)
+  "Infer the Confluence scope page for the current file's directory.
+The result is cached per directory and space for this session."
+  (let* ((start (file-name-directory (or buffer-file-name default-directory)))
+         (key (concat start "\0" space))
+         (cached (gethash key org-conf--scope-cache 'miss)))
+    (if (not (eq cached 'miss))
+        cached
+      (let ((scope (org-conf--infer-parent-scope-uncached space start)))
+        (puthash key scope org-conf--scope-cache)
+        scope))))
+
+(defun org-conf--recent-parent-choices (space &optional exclude)
+  "Return `(use ID)' shortcuts for the most-used parents in SPACE.
+EXCLUDE lists page ids already offered in the current menu."
+  (let ((freq (sort (copy-sequence
+                     (org-conf--freq-load org-conf-parent-freq-file))
+                    (lambda (a b) (> (cdr a) (cdr b)))))
+        (result nil)
+        (seen nil))
+    (dolist (cell freq)
+      (let ((id (car cell))
+            (count (cdr cell)))
+        (when (and (< (length result) org-conf-recent-parent-limit)
+                   (not (member id exclude))
+                   (not (member id seen)))
+          (let ((info (org-conf--cached-page-info id)))
+            (when (and info (equal space (plist-get info :space)))
+              (push (cons (format "★ 就用 %s (常用 %d 次)"
+                                  (plist-get info :title) count)
+                          (list 'use id))
+                    result)
+              (push id seen))))))
+    (nreverse result)))
+
+(defun org-conf--space-roots-or-warn (space)
+  "Return SPACE's top-level pages, warning when the listing came back empty.
+An empty list means either an empty space or that this Confluence
+rejected `depth=root'; either way the user needs to be told rather than
+shown a menu with nothing in it."
+  (let ((roots (org-conf--read-or-nil #'org-conf-backend-get-space-roots space)))
+    (unless roots
+      (message "Space %s listed no top-level pages; type a page URL instead."
+               space))
+    roots))
+
+(defun org-conf--parent-page (page)
+  "Return PAGE's parent metadata, or nil at the top."
+  (let ((parent-id (plist-get page :parent-id)))
+    (when parent-id
+      (org-conf--cached-page-info parent-id))))
+
+(defun org-conf--read-parent-by-drill-down (space &optional scope)
+  "Walk SPACE's page tree one level at a time; return the parent id.
+Start at SCOPE when non-nil; `..' climbs to its parent.  Each menu lists
+the current page, frequently used pages, direct children and manual
+entry.  Returns nil when the user settles on the space root itself."
+  (let ((current scope)
+        (trail nil)
+        (answer 'pending)
+        (children-cache (make-hash-table :test 'equal)))
+    (while (eq answer 'pending)
+      (let* ((children
+              (if current
+                  (let ((cached (gethash (plist-get current :id)
+                                         children-cache 'miss)))
+                    (if (eq cached 'miss)
+                        (puthash (plist-get current :id)
+                                 (org-conf--read-or-nil
+                                  #'org-conf-backend-get-children
+                                  (plist-get current :id))
+                                 children-cache)
+                      cached))
+                (org-conf--space-roots-or-warn space)))
+             (recent (org-conf--recent-parent-choices
+                      space
+                      (cons (and current (plist-get current :id))
+                            (mapcar (lambda (child) (plist-get child :id))
+                                    children))))
+             (choices (org-conf--drill-choices current children recent))
+             (action (cdr (assoc (completing-read "Parent page: " choices nil t)
+                                 choices))))
+        (pcase action
+          (`(root) (setq answer nil))
+          (`(up)
+           (if trail
+               (setq current (pop trail))
+             (setq current (org-conf--parent-page current))))
+          (`(manual) (setq answer (org-conf--read-parent-id-manually)))
+          (`(confirm ,id) (setq answer id))
+          (`(use ,id) (setq answer id))
+          (`(descend ,id)
+           (let ((child (seq-find (lambda (c) (equal id (plist-get c :id)))
+                                  children)))
+             (when child
+               (push current trail)
+               (setq current (plist-put child :parent-id
+                                        (plist-get current :id)))))))))
+    answer))
+
+(defun org-conf--read-parent-id (space)
+  "Return the id of the page to create under, or nil for the space root.
+With `org-conf-root-parent-page' set, its descendants are offered as one
+flat, most-used-first list.  Otherwise SPACE's page tree is walked one
+level at a time; see `org-conf--read-parent-by-drill-down'.  Either way
+a URL can still be typed by hand."
+  (let ((root (string-trim org-conf-root-parent-page)))
+    (cond
+     ((string-empty-p root)
+      (let ((scope (org-conf--infer-parent-scope space)))
+        (when scope
+          (message "Parent scope: %s" (plist-get scope :title)))
+        (org-conf--read-parent-by-drill-down space scope)))
+     ((not (org-conf--return-id-from-url root))
+      (message "No page id in `org-conf-root-parent-page' (%s); asking instead."
+               root)
+      (org-conf--read-parent-id-manually))
+     (t
+      (let* ((id (org-conf--return-id-from-url root))
+             (node (org-conf--read-or-nil #'org-conf-backend-get-page-info id)))
+        (if (not (plist-get node :title))
+            (progn
+              (message "Cannot read Confluence page %s; asking for a parent page instead."
+                       id)
+              (org-conf--read-parent-id-manually))
+          (let* ((candidates (org-conf--collect-descendants
+                              node
+                              (lambda (page-id)
+                                (org-conf--read-or-nil
+                                 #'org-conf-backend-get-children page-id))
+                              org-conf-parent-max-pages))
+                 (sorted (org-conf--sort-parent-candidates
+                          candidates
+                          (org-conf--freq-load org-conf-parent-freq-file)))
+                 (choices (append (org-conf--parent-choices sorted)
+                                  (list (cons org-conf-manual-parent-label
+                                              '(manual)))))
+                 (picked (cdr (assoc (completing-read "Parent page: " choices nil t)
+                                     choices))))
+            (if (equal picked '(manual))
+                (org-conf--read-parent-id-manually)
+              picked))))))))
+
+(defvar org-conf--just-created nil
+  "Non-nil while the export flow uploads a page it just created.
+If the user declines that upload, the flow stops instead of creating
+another page.")
+
+(defvar org-conf--upload-attachments t
+  "Non-nil means the current export flow uploads page attachments.
+Bound by `org-conf--export-to-conf' for `f f' (t) and `f w' (nil).")
+
+(defun org-conf-create-page-and-export ()
+  "Create a Confluence page for the current buffer, then export into it.
+Ask for the target space, title and parent page, POST an empty page,
+record #+CONF_ID/#+CONF_SPACE/#+CONF_PAGE in the buffer, then run the
+normal `org-conf-export-to-conf' flow so the body and any images are
+uploaded.  Nothing is written when Confluence refuses the creation."
+  (interactive)
+  (let* ((space (org-conf--read-space))
+         (title (org-conf--read-title))
+         (parent-id (org-conf--read-parent-id space))
+         (created (org-conf-backend-create-page title space parent-id))
+         (page-id (plist-get created :id)))
+    (unless page-id
+      (user-error "Confluence did not create the page; the buffer is untouched"))
+    (org-conf--log "✅ created page %s (%s)" title page-id)
+    (when parent-id
+      (org-conf--freq-save org-conf-parent-freq-file
+                           (org-conf--freq-bump
+                            parent-id
+                            (org-conf--freq-load org-conf-parent-freq-file))))
+    (let ((page-url (org-conf--page-url (plist-get created :webui))))
+      (org-conf--insert-conf-keywords space page-url page-id)
+      (message "Created page 「%s」 (%s)." title page-id)
+      (let ((org-conf--just-created t))
+        (org-conf--export-to-conf
+         org-conf--upload-attachments nil nil nil nil nil)))))
+
+(defun org-conf--export-to-conf
+    (upload-attachments &optional async subtreep visible-only body-only ext-plist)
+  "Export to Confluence; UPLOAD-ATTACHMENTS controls attachment uploads.
+When the buffer already has #+CONF_ID, ask before updating that page;
+declining runs the create-page flow.  With no #+CONF_ID, create a page
+first."
+  ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
+  ;; So put it above exporting.
+  (let ((conf-id (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-id))
+        (conf-space (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-space))
+        (title (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :title)))
+        (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
+        (version 0)
+        (ver-msg "")
+        (res nil)
+        (output nil)
+        (org-conf-plist nil))
+    (org-conf--log "✅ backend: %s, page: %s, attachments: %s"
+                   (org-conf--active-backend) conf-id upload-attachments)
+    (if (eq 'update (org-conf--export-action conf-id))
+        (let* ((info (org-conf--read-or-nil
+                      #'org-conf-backend-get-page-info conf-id))
+               (page-title (or (plist-get info :title)
+                               (format "page %s" conf-id))))
+          (if (not (y-or-n-p
+                    (format "Upload to 「%s」 (%s)? " page-title conf-id)))
+              (cond
+               (org-conf--just-created
+                (org-conf--log "↪ upload declined for newly created page %s"
+                               conf-id)
+                (message "Page 「%s」 (%s) created but not uploaded; the buffer now points at it."
+                         page-title conf-id))
+               (t
+                (org-conf--log "↪ new page requested instead of %s" conf-id)
+                (let ((org-conf--upload-attachments upload-attachments))
+                  (org-conf-create-page-and-export))))
+            (org-conf--log "✅ upload confirmed: %s" page-title)
+            ;; Update page version number.
+            (setq res info)
+            (setq version (1+ (or (plist-get res :version) 0)))
+            ;; Pass export parameters through communication channel.
+            (setq org-conf-plist
+                  (org-combine-plists
+                   ext-plist
+                   (list :org-conf-do-post upload-attachments)
+                   `(:org-conf-user ,user)
+                   `(:org-conf-id ,conf-id)))
+            (setq output (org-export-as
+                          'org-conf-html subtreep visible-only body-only org-conf-plist))
+            (org-conf--log "✅ export: %d chars" (length output))
+            ;; Update the page!
+            (setq ver-msg (read-string "Version message: "))
+            (org-conf-backend-update-page conf-id title conf-space output version ver-msg)))
+      (let ((org-conf--upload-attachments upload-attachments))
+        (org-conf-create-page-and-export)))))
 
 (defun org-conf-export-to-conf
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export to Confluence by calling `org-conf-rest-put function."
+  "Export to Confluence, uploading attachments.
+If the buffer already has #+CONF_ID, ask before updating that page and
+run the create-page flow when declined; otherwise create a page first."
   (interactive)
-  ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
-  ;; So put it above exporting.
-  (let ((conf-id (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-id))
-        (conf-space (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-space))
-        (title (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :title)))
-        (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
-        (version 0)
-        (ver-msg "")
-        (res nil)
-        (output nil)
-        (org-conf-plist nil))
-    (if conf-id
-        (progn
-          ;; Update page version number.
-          (setq res (org-conf-rest-get-page-json conf-id))
-          (setq version (1+ (cdr (assoc 'number (assoc 'version res)))))
-          ;; Pass export parameters through communication channel.
-          (setq org-conf-plist
-                (org-combine-plists
-                 ext-plist
-                 '(:org-conf-do-post t)
-                 `(:org-conf-user ,user)
-                 `(:org-conf-id ,conf-id)))
-          (setq output (org-export-as
-                        'org-conf-html subtreep visible-only body-only org-conf-plist))
-          ;; Update the page!
-          (setq ver-msg (read-string "Version message: "))
-          (org-conf-rest-put conf-id title conf-space output version ver-msg))
-      (message "No CONF_ID found!"))))
+  (org-conf--export-to-conf t async subtreep visible-only body-only ext-plist))
 
 (defun org-conf-export-to-conf-without-post
     (&optional async subtreep visible-only body-only ext-plist)
-  "Export to Confluence by calling `org-conf-rest-put function."
+  "Export to Confluence without re-uploading attachments.
+Otherwise identical to `org-conf-export-to-conf': existing pages are
+confirmed first, and a missing #+CONF_ID creates a new page."
   (interactive)
-  ;; Option "conf-id" cannot be retrieved after org-export-to-buffer!
-  ;; So put it above exporting.
-  (let ((conf-id (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-id))
-        (conf-space (plist-get (org-export--get-inbuffer-options 'org-conf-html) :conf-space))
-        (title (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :title)))
-        (user (car (plist-get (org-export--get-inbuffer-options 'org-conf-html) :author)))
-        (version 0)
-        (ver-msg "")
-        (res nil)
-        (output nil)
-        (org-conf-plist nil))
-    (if conf-id
-        (progn
-          ;; Update page version number.
-          (setq res (org-conf-rest-get-page-json conf-id))
-          (setq version (1+ (cdr (assoc 'number (assoc 'version res)))))
-          ;; Pass export parameters through communication channel.
-          (setq org-conf-plist
-                (org-combine-plists
-                 ext-plist
-                 '(:org-conf-do-post nil)
-                 `(:org-conf-user ,user)
-                 `(:org-conf-id ,conf-id)))
-          (setq output (org-export-as
-                        'org-conf-html subtreep visible-only body-only org-conf-plist))
-          ;; Update the page!
-          (setq ver-msg (read-string "Version message: "))
-          (org-conf-rest-put conf-id title conf-space output version ver-msg))
-      (message "No CONF_ID found!"))))
+  (org-conf--export-to-conf nil async subtreep visible-only body-only ext-plist))
 
 (defun org-conf-export-to-buffer
     (&optional async subtreep visible-only body-only ext-plist)
@@ -1054,11 +2477,14 @@ information."
 
 (defun org-conf-forget-password
     (&optional async subtreep visible-only body-only ext-plist)
-  "Don't worry, let's retry the password... and forget the old one."
+  "Don't worry, let's retry the password... and forget the old one.
+This only affects the REST backend; the CLI manages its own credentials."
   (interactive)
   (auth-source-forget-all-cached)
-  (message "Password cache has been forgotten!")
-  )
+  (message "Password cache has been forgotten!%s"
+           (if (eq (org-conf--active-backend) 'cli)
+               " The CLI backend manages its own credentials; see `confluence profile list'."
+             "")))
 
 (defun org-conf-open-page
     (&optional async subtreep visible-only body-only ext-plist)
@@ -1105,10 +2531,11 @@ information."
      ((?b "To buffer" org-conf-export-to-buffer)
       (?p "Page info" org-conf-export-page-info)
       (?i "Image info" org-conf-export-img-info)
-      (?f "To Confluence" org-conf-export-to-conf)
-      (?w "To Confluence (w/o POST)" org-conf-export-to-conf-without-post)
+      (?f "To Confluence (creates page if new)" org-conf-export-to-conf)
+      (?w "To Confluence (no attachment upload)" org-conf-export-to-conf-without-post)
       (?r "Forget the wrong password" org-conf-forget-password)
       (?o "Open page" org-conf-open-page)
+      (?l "Show debug log" org-conf-show-log)
       ))
   )
 
