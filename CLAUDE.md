@@ -14,7 +14,7 @@ Load `ox-conf.el` in Emacs (e.g., via `load-file` or `require`). Then in any `.o
   - `f b` — export to a preview buffer
   - `f p` — fetch page info (title, version) from Confluence and print it
   - `f i` — list image attachments on the target Confluence page
-  - `f f` — full export: transcode the Org buffer and PUT it to Confluence (uploads images via POST). **If the buffer has no `#+CONF_ID`, it creates the page first** — see below.
+  - `f f` — full export: if the buffer has `#+CONF_ID`, first asks whether to upload to that page (showing its freshly fetched title); answering no runs the create-page flow. With no `#+CONF_ID`, it creates the page first — see below.
   - `f w` — export and PUT without uploading images
   - `f r` — clear cached Confluence REST credentials (calls `auth-source-forget-all-cached`); the CLI backend manages its own credentials
   - `f o` — open the Confluence page in the browser (new in 2026-05)
@@ -52,16 +52,23 @@ status/stderr; a failed call logs a copy-pasteable elisp form:
 Page bodies are written to a temporary UTF-8 file; on failure the file is kept
 and its path logged, so the printed `--file` command can be rerun.
 `org-conf-log-enabled` turns the log off; `org-conf-log-max-lines` caps it.
+The buffer uses `org-conf-log-mode`, derived from `special-mode`: read-only,
+tail-following, font-locked (✅ green, ❌ red, commands blue), and Evil opens it
+in normal state (`with-eval-after-load 'evil` calls `evil-set-initial-state`).
 
 ### Creating a page from scratch (2026-10-10)
 
 `f f` branches on whether the buffer has a `#+CONF_ID` (`org-conf--export-action`).
-With no id it runs `org-conf-create-page-and-export`, which asks for the target
-space, the page title (defaulting to `#+TITLE:`, then the file name) and a parent
-page, POSTs an empty page, writes `#+CONF_SPACE:`/`#+CONF_PAGE:`/`#+CONF_ID:` into
-the buffer (unsaved — you keep control), and then calls the normal
-`org-conf-export-to-conf` flow, so Confluence ends up with version 2 holding the
-real content.
+With an id it asks `Upload to 「title」 (id)?` using the page's freshly fetched
+title; answering no falls through to the same create-page flow, leaving the old
+page untouched. With no id it runs `org-conf-create-page-and-export`, which asks
+for the target space, the page title (defaulting to `#+TITLE:`, then the file
+name) and a parent page, POSTs an empty page, writes
+`#+CONF_SPACE:`/`#+CONF_PAGE:`/`#+CONF_ID:` into the buffer (unsaved — you keep
+control), and then calls the normal `org-conf-export-to-conf` flow, so Confluence
+ends up with version 2 holding the real content. The create flow binds
+`org-conf--skip-upload-confirm` so it does not ask again about the page it just
+made.
 
 The `#+CONF_*` keywords are placed by `org-conf--insert-conf-keywords` at the end of
 the file's leading keyword block, found with `org-conf--keyword-block-end` (org's
@@ -109,14 +116,16 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (126 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (131 tests) in `test/ox-conf-test.el`. The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement, the
 drill-down decision table, backend selection and the REST adapters, the CLI
 command lines and error handling, parent-scope inference (common ancestor,
 sibling/recent/title-search fallbacks), recent-parent filtering, the file-like
-menu (`..`, confirm, recent, children, manual), and the background log (markers,
-command strings, elisp forms, body retention).
+menu (`..`, confirm, recent, children, manual), the background log (markers,
+command strings, elisp forms, body retention, read-only special-mode and
+highlighting), and the `f f` upload confirmation (accept, decline-to-create,
+and no re-prompt after creation).
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
 `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
 backend boundaries; the drill-down stubs also assert which menus were shown.

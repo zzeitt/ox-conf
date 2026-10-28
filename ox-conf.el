@@ -61,6 +61,9 @@
 ;; Exporting:
 ;;   - Wake up org-export dispatch.
 ;;   - Press ~f f~ for exporting to the CONF_PAGE you provided.
+;;   - If the buffer already has ~#+CONF_ID~, ~f f~ asks whether to upload
+;;     to that page (showing its freshly fetched title).  Answering no
+;;     runs the create-page flow instead, leaving the old page alone.
 ;;   - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
 ;;     title, lets you settle on a parent page, creates the page, writes
 ;;     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
@@ -88,7 +91,9 @@
 ;;   - Page bodies go to a temporary UTF-8 file.  If the call fails, the
 ;;     file is kept and its path is logged, so the command can be rerun.
 ;;   - =f l= opens the log; ~org-conf-log-enabled~ turns it off and
-;;     ~org-conf-log-max-lines~ caps its size.
+;;     ~org-conf-log-max-lines~ caps its size.  The buffer is a read-only
+;;     =special-mode= (Evil normal state, =q= to quit) with ✅/❌
+;;     highlighting.
 ;;
 ;; Note:
 ;;   Most of the codes in this file are adapted from =ox-html.el=.
@@ -137,6 +142,9 @@
 ;;   - 2026-10-28: Added a background debug log (=*ox-conf-log*/, `f l'):
 ;;                 every backend call logs ✅/❌ with timing, CLI commands,
 ;;                 elisp reproduction forms, and keeps failed body files.
+;;   - 2026-10-28: `f f' now asks before updating an existing page; saying
+;;                 no runs the create-page flow.  The log buffer is a
+;;                 read-only special-mode with Evil/font-lock support.
 
 
 ;;; Code:
@@ -255,14 +263,62 @@ on `exec-path', and falls back to the REST API otherwise."
   (interactive)
   (setq org-conf-log-level -1))
 
+(defface org-conf-log-timestamp
+  '((t :foreground "gray50"))
+  "Face for the timestamp at the start of an ox-conf log line."
+  :group 'org-export-conf)
+
+(defface org-conf-log-success
+  '((t :foreground "green"))
+  "Face for successful ox-conf log lines."
+  :group 'org-export-conf)
+
+(defface org-conf-log-error
+  '((t :foreground "red"))
+  "Face for failed ox-conf log lines."
+  :group 'org-export-conf)
+
+(defface org-conf-log-command
+  '((t :foreground "steel blue"))
+  "Face for reproducible commands in the ox-conf log."
+  :group 'org-export-conf)
+
+(defvar org-conf-log-font-lock-keywords
+  '(("^\\[[0-9:]+\\]" 0 'org-conf-log-timestamp)
+    ("✅" 0 'org-conf-log-success)
+    ("❌" 0 'org-conf-log-error)
+    ("^\\s-+CMD\\b.*" 0 'org-conf-log-command)
+    ("^\\s-+ELISP\\b.*" 0 'org-conf-log-command)
+    ("^\\s-+STDERR:.*" 0 'org-conf-log-error))
+  "Font-lock keywords for `org-conf-log-mode'.")
+
+(define-derived-mode org-conf-log-mode special-mode "ox-conf-log"
+  "Major mode for the ox-conf background log.
+Read-only and tail-following like `messages-buffer-mode', with
+success/error/command highlighting."
+  (setq-local window-point-insertion-type t)
+  (setq font-lock-defaults '(org-conf-log-font-lock-keywords t))
+  (font-lock-mode 1))
+
+(with-eval-after-load 'evil
+  (evil-set-initial-state 'org-conf-log-mode 'normal))
+
 (defun org-conf--log-buffer ()
   "Return the ox-conf log buffer, creating it if needed."
-  (get-buffer-create org-conf-log-buffer-name))
+  (let ((buffer (get-buffer-create org-conf-log-buffer-name)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'org-conf-log-mode)
+        (org-conf-log-mode)))
+    buffer))
 
 (defun org-conf-show-log ()
   "Display the ox-conf background log."
   (interactive)
-  (pop-to-buffer (org-conf--log-buffer)))
+  (let ((buffer (org-conf--log-buffer)))
+    (with-current-buffer buffer
+      (when (fboundp 'font-lock-ensure)
+        (font-lock-ensure)))
+    (pop-to-buffer buffer)))
 
 (defun org-conf--log (format-string &rest args)
   "Append a timestamped line to the ox-conf log and echo it.
@@ -2267,6 +2323,10 @@ a URL can still be typed by hand."
                 (org-conf--read-parent-id-manually)
               picked))))))))
 
+(defvar org-conf--skip-upload-confirm nil
+  "Non-nil means `org-conf-export-to-conf' must not ask before uploading.
+Bound to t while the create-page flow uploads the page it just made.")
+
 (defun org-conf-create-page-and-export ()
   "Create a Confluence page for the current buffer, then export into it.
 Ask for the target space, title and parent page, POST an empty page,
@@ -2290,7 +2350,8 @@ uploaded.  Nothing is written when Confluence refuses the creation."
     (let ((page-url (org-conf--page-url (plist-get created :webui))))
       (org-conf--insert-conf-keywords space page-url page-id)
       (message "Created page 「%s」 (%s); uploading content..." title page-id)
-      (org-conf-export-to-conf))))
+      (let ((org-conf--skip-upload-confirm t))
+        (org-conf-export-to-conf)))))
 
 (defun org-conf-export-to-conf
     (&optional async subtreep visible-only body-only ext-plist)
@@ -2312,23 +2373,33 @@ first; see `org-conf-create-page-and-export'."
     (org-conf--log "✅ backend: %s, page: %s"
                    (org-conf--active-backend) conf-id)
     (if (eq 'update (org-conf--export-action conf-id))
-        (progn
-          ;; Update page version number.
-          (setq res (org-conf-backend-get-page-info conf-id))
-          (setq version (1+ (or (plist-get res :version) 0)))
-          ;; Pass export parameters through communication channel.
-          (setq org-conf-plist
-                (org-combine-plists
-                 ext-plist
-                 '(:org-conf-do-post t)
-                 `(:org-conf-user ,user)
-                 `(:org-conf-id ,conf-id)))
-          (setq output (org-export-as
-                        'org-conf-html subtreep visible-only body-only org-conf-plist))
-          (org-conf--log "✅ export: %d chars" (length output))
-          ;; Update the page!
-          (setq ver-msg (read-string "Version message: "))
-          (org-conf-backend-update-page conf-id title conf-space output version ver-msg))
+        (let* ((info (org-conf--read-or-nil
+                      #'org-conf-backend-get-page-info conf-id))
+               (page-title (or (plist-get info :title)
+                               (format "page %s" conf-id))))
+          (if (and (not org-conf--skip-upload-confirm)
+                   (not (y-or-n-p
+                         (format "Upload to 「%s」 (%s)? " page-title conf-id))))
+              (progn
+                (org-conf--log "↪ new page requested instead of %s" conf-id)
+                (org-conf-create-page-and-export))
+            (org-conf--log "✅ upload confirmed: %s" page-title)
+            ;; Update page version number.
+            (setq res info)
+            (setq version (1+ (or (plist-get res :version) 0)))
+            ;; Pass export parameters through communication channel.
+            (setq org-conf-plist
+                  (org-combine-plists
+                   ext-plist
+                   '(:org-conf-do-post t)
+                   `(:org-conf-user ,user)
+                   `(:org-conf-id ,conf-id)))
+            (setq output (org-export-as
+                          'org-conf-html subtreep visible-only body-only org-conf-plist))
+            (org-conf--log "✅ export: %d chars" (length output))
+            ;; Update the page!
+            (setq ver-msg (read-string "Version message: "))
+            (org-conf-backend-update-page conf-id title conf-space output version ver-msg)))
       (org-conf-create-page-and-export))))
 
 (defun org-conf-export-to-conf-without-post

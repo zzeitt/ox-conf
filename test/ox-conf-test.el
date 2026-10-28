@@ -1332,7 +1332,8 @@ list of menus that were shown, in order.  The getter is repeatable."
         (org-conf-log-enabled t))
     (unwind-protect
         (progn
-          (with-current-buffer (org-conf--log-buffer) (erase-buffer))
+          (with-current-buffer (org-conf--log-buffer)
+            (let ((inhibit-read-only t)) (erase-buffer)))
           (org-conf--log "hello %s" "world")
           (with-current-buffer (org-conf--log-buffer)
             (should (string-match-p "\\`\\[[0-9:]+\\] hello world"
@@ -1355,7 +1356,8 @@ list of menus that were shown, in order.  The getter is repeatable."
         (org-conf-log-max-lines 3))
     (unwind-protect
         (progn
-          (with-current-buffer (org-conf--log-buffer) (erase-buffer))
+          (with-current-buffer (org-conf--log-buffer)
+            (let ((inhibit-read-only t)) (erase-buffer)))
           (dotimes (i 5) (org-conf--log "line %d" i))
           (with-current-buffer (org-conf--log-buffer)
             (should (= 3 (count-lines (point-min) (point-max))))
@@ -1435,5 +1437,93 @@ list of menus that were shown, in order.  The getter is repeatable."
           (should (equal (buffer-name) org-conf-log-buffer-name)))
       (when (get-buffer org-conf-log-buffer-name)
         (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-log-mode-is-read-only-and-special ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*"))
+    (unwind-protect
+        (with-current-buffer (org-conf--log-buffer)
+          (should (eq major-mode 'org-conf-log-mode))
+          (should (derived-mode-p 'special-mode))
+          (should buffer-read-only))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-log-mode-highlights-success-and-error ()
+  (let ((org-conf-log-buffer-name " *ox-conf-test-log*"))
+    (unwind-protect
+        (progn
+          (with-current-buffer (org-conf--log-buffer)
+            (let ((inhibit-read-only t)) (erase-buffer)))
+          (org-conf--log "✅ ok")
+          (org-conf--log "❌ bad")
+          (with-current-buffer (org-conf--log-buffer)
+            (font-lock-ensure)
+            (goto-char (point-min))
+            (search-forward "✅")
+            (should (eq 'org-conf-log-success
+                        (get-text-property (1- (point)) 'face)))
+            (goto-char (point-min))
+            (search-forward "❌")
+            (should (eq 'org-conf-log-error
+                        (get-text-property (1- (point)) 'face)))))
+      (when (get-buffer org-conf-log-buffer-name)
+        (kill-buffer org-conf-log-buffer-name)))))
+
+(ert-deftest ox-conf-test-export-to-conf-prompts-before-updating ()
+  (let ((prompt nil)
+        (updated nil)
+        (org-conf--skip-upload-confirm nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                 (lambda (_id) (list :id "7" :title "Doc" :version 3)))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (text) (setq prompt text) t))
+                ((symbol-function 'org-export-as)
+                 (lambda (&rest _) "<p>x</p>"))
+                ((symbol-function 'read-string) (lambda (&rest _) ""))
+                ((symbol-function 'org-conf-backend-update-page)
+                 (lambda (&rest args) (setq updated args))))
+        (org-conf-export-to-conf)
+        (should (string-match-p "Doc" prompt))
+        (should (equal "7" (nth 0 updated)))
+        (should (equal 4 (nth 4 updated)))))))
+
+(ert-deftest ox-conf-test-export-to-conf-creates-when-declined ()
+  (let ((created nil)
+        (updated nil)
+        (org-conf--skip-upload-confirm nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                 (lambda (_id) (list :id "7" :title "Doc" :version 3)))
+                ((symbol-function 'y-or-n-p) (lambda (_text) nil))
+                ((symbol-function 'org-conf-create-page-and-export)
+                 (lambda () (setq created t)))
+                ((symbol-function 'org-conf-backend-update-page)
+                 (lambda (&rest _) (setq updated t))))
+        (org-conf-export-to-conf)
+        (should created)
+        (should-not updated)))))
+
+(ert-deftest ox-conf-test-create-flow-skips-the-upload-confirm ()
+  (let ((org-conf--skip-upload-confirm t)
+        (updated nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
+      (cl-letf (((symbol-function 'org-conf-backend-get-page-info)
+                 (lambda (_id) (list :id "7" :title "Doc" :version 3)))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (&rest _) (error "must not prompt")))
+                ((symbol-function 'org-export-as)
+                 (lambda (&rest _) "<p>x</p>"))
+                ((symbol-function 'read-string) (lambda (&rest _) ""))
+                ((symbol-function 'org-conf-backend-update-page)
+                 (lambda (&rest args) (setq updated args))))
+        (org-conf-export-to-conf)
+        (should updated)))))
 
 ;;; ox-conf-test.el ends here

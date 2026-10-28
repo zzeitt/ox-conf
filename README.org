@@ -130,6 +130,9 @@ Prerequisites:
 Exporting:
   - Wake up org-export dispatch.
   - Press ~f f~ for exporting to the CONF_PAGE you provided.
+  - If the buffer already has ~#+CONF_ID~, ~f f~ asks whether to upload
+    to that page (showing its freshly fetched title).  Answering no
+    runs the create-page flow instead, leaving the old page alone.
   - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
     title, lets you settle on a parent page, creates the page, writes
     ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
@@ -157,7 +160,8 @@ Debug log:
   - Page bodies go to a temporary UTF-8 file.  If the call fails, the
     file is kept and its path is logged, so the command can be rerun.
   - =f l= opens the log; ~org-conf-log-enabled~ turns it off and
-    ~org-conf-log-max-lines~ caps its size.
+    ~org-conf-log-max-lines~ caps its size.  The buffer is a read-only
+    =special-mode= (Evil normal state, =q= to quit) with ✅/❌ highlighting.
 
 Note:
   Most of the codes in this file are adapted from =ox-html.el=.
@@ -206,6 +210,9 @@ Change Log:
   - 2026-10-28: Added a background debug log (=*ox-conf-log*=, =f l=):
                 every backend call logs ✅/❌ with timing, CLI commands,
                 elisp reproduction forms, and keeps failed body files.
+  - 2026-10-28: =f f= asks before updating an existing page; saying no
+                runs the create-page flow.  The log buffer is a read-only
+                special-mode with Evil/font-lock support.
 
 * Example
 Given this file: =tmp.org=.
