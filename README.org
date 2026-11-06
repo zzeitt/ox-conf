@@ -95,33 +95,79 @@ This is an org export backend that supports Confluence wiki storage format...
 
 Prerequisites:
   - Confluene page:
-    - Create one conf page on your Confluence cloud side. (Currently
-      ox-conf.el doesn't support creating the page from scratch,
-      instead it updates an existing page when exporting.)
+    - Nothing to prepare by hand: pressing ~f f~ on an org file that
+      has no ~#+CONF_ID~ creates the page for you.
   - Org file:
     - Add ~#+CONF_ID~ and ~#+CONF_SPACE~ at the top of the .org file
-      you want to export.
+      you want to export, or let ~f f~ create the page and write them
+      for you.
   - Emacs init:
     - Install =ox-conf.el=...
     - Specify ~org-conf-url~ according to your host URL in your init file (e.g. =init.el=).
     - Specify ~org-conf-jira-chart-server~ according to your case.
       - Ref: https://confluence.atlassian.com/conf59/jira-chart-macro-792499235.html
     - Specify ~org-conf-jria-chart-server-id~ according to your case.
+    - Optionally specify ~org-conf-root-parent-page~ (a page URL or
+      id): when set, parent pages are picked from that page's
+      descendants.  When it is left empty, the picker infers a scope
+      from the current file's local directory (the common ancestor of
+      nearby exported .org files, then the parent of the most-used
+      parent page, then a title match) and starts there.  Menus are
+      file-like: ~..~ goes to the parent page, direct children are
+      entered, and ~✓ 就用 …~ settles on the current page.  Frequently
+      used parents are offered first.  Candidates show titles, never
+      URLs; a URL can still be typed by hand.
+    - Choose the transport with ~org-conf-backend~:
+      - ~auto~ (default): use the =confluence= CLI when
+        ~org-conf-cli-program~ is on ~exec-path~, otherwise the REST
+        API;
+      - ~rest~: always use the REST API (auth via ~auth-source~);
+      - ~cli~: always use the =confluence= CLI, which needs a
+        configured profile (see ~confluence profile list~).
+      The CLI does not use Emacs credentials, and ~f r~ only clears the
+      REST auth cache.
 
 Exporting:
   - Wake up org-export dispatch.
   - Press ~f f~ for exporting to the CONF_PAGE you provided.
+  - If the buffer already has ~#+CONF_ID~, ~f f~ asks whether to upload
+    to that page (showing its freshly fetched title).  Answering no
+    runs the create-page flow instead, leaving the old page alone.
+    ~f f~ and ~f w~ share this confirm/create flow; ~f w~ only skips
+    re-uploading attachments.
+  - If the buffer has no ~#+CONF_ID~, ~f f~ asks for a space and a
+    title, lets you settle on a parent page, creates the page, writes
+    ~#+CONF_SPACE~/~#+CONF_PAGE~/~#+CONF_ID~ into the file's front
+    matter (after the leading #+ keywords, never above a shebang or
+    mode line), and then asks before uploading the content; declining
+    leaves the empty page in place.  If the file already pointed at a
+    page, that old CONF block is kept below the new one as an org
+    comment (only one active CONF_ID).
 
 Options:
   - ~f b~: "To buffer" org-conf-export-to-buffer
   - ~f p~: "Page info" org-conf-export-page-info
   - ~f i~: "Image info" org-conf-export-img-info
   - ~f f~: "To Confluence" org-conf-export-to-conf
-  - ~f w~: "To Confluence (w/o POST)" org-conf-export-to-conf-without-post
-  - ~f r~: "Forget the wrong password" org-conf-forget-password
+  - ~f w~: "To Confluence (no attachment upload)"
+           org-conf-export-to-conf-without-post
+  - ~f r~: "Forget the wrong password" (REST auth cache only)
+           org-conf-forget-password
+  - ~f l~: "Show debug log" org-conf-show-log
 
 Response:
   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
+
+Debug log:
+  - Every backend call appends a timestamped ~✅~/~❌~ line to
+    ~org-conf-log-buffer-name~ (default =*ox-conf-log*=), with timing.
+    CLI calls also log the exact =confluence --json ...= command; a
+    failed call logs a copy-pasteable elisp form with the active backend.
+  - Page bodies go to a temporary UTF-8 file.  If the call fails, the
+    file is kept and its path is logged, so the command can be rerun.
+  - =f l= opens the log; ~org-conf-log-enabled~ turns it off and
+    ~org-conf-log-max-lines~ caps its size.  The buffer is a read-only
+    =special-mode= (Evil normal state, =q= to quit) with ✅/❌ highlighting.
 
 Note:
   Most of the codes in this file are adapted from =ox-html.el=.
@@ -144,6 +190,40 @@ Change Log:
   - 2025-11-17: Deprecated 'example-block'.
   - 2025-11-27: Added 'footnote' support.
   - 2026-05-21: Added 'f o' dispatch action to open conf page.
+  - 2026-10-10: 'f f' now creates a Confluence page when the buffer has
+                no #+CONF_ID: it asks for space/title/parent page,
+                POSTs the page, writes the #+CONF_* keywords back, and
+                then runs the normal export.  Parent pages are picked
+                from the descendants of ~org-conf-root-parent-page~,
+                ordered by how often they were chosen before.
+  - 2026-10-10: Parent pages are offered by title rather than URL.
+                With no ~org-conf-root-parent-page~, walk the space's
+                tree one level at a time (top-level pages come from
+                /rest/api/space/{key}/content?depth=root).  The
+                CONF_* keywords now join the file's front matter after
+                #+TITLE: instead of being pushed above it.
+  - 2026-10-24: Fixed parent-page listing: the space-content endpoint
+                groups results by content type, so =page.results= is
+                now unwrapped and paginated.  CONF_* stays below a
+                leading shebang / mode line.  Added the =confluence=
+                CLI backend behind ~org-conf-backend~ (auto/rest/cli).
+  - 2026-10-27: The parent picker infers its scope from the local
+                directory (sibling CONF pages, the parent of the
+                most-used parent, then a title match) and walks direct
+                children with =..= / confirm, like file navigation.
+                Frequent parents come first; URLs only appear in the
+                manual action.
+  - 2026-10-28: Added a background debug log (=*ox-conf-log*=, =f l=):
+                every backend call logs ✅/❌ with timing, CLI commands,
+                elisp reproduction forms, and keeps failed body files.
+  - 2026-10-28: =f f= asks before updating an existing page; saying no
+                runs the create-page flow.  The log buffer is a read-only
+                special-mode with Evil/font-lock support.
+  - 2026-10-28: =f f= and =f w= share the same confirm/create flow; =f w=
+                only skips attachment uploads.  Replacing a page keeps
+                the old CONF block as a comment (one active ID).  A newly
+                created page is confirmed before upload too; declining
+                leaves that empty page and stops.
 
 * Example
 Given this file: =tmp.org=.
