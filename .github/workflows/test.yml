@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ox-conf-test
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Emacs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-nox
+
+      - name: Install request
+        run: |
+          emacs -Q --batch --eval '(progn
+            (require (quote package))
+            (setq package-user-dir (expand-file-name "~/.emacs.d/elpa"))
+            (add-to-list (quote package-archives)
+                         (quote ("melpa" . "https://melpa.org/packages/")))
+            (package-initialize)
+            (unless (package-installed-p (quote request))
+              (package-refresh-contents)
+              (package-install (quote request))))'
+
+      - name: Run ERT suite
+        run: emacs -Q --batch -L test -l test/run-tests.el

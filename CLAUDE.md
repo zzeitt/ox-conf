@@ -262,5 +262,11 @@ Use `M-x ske-conf` for a quick interactive template that prompts for space and p
 
 ## CI/CD
 
+- `.github/workflows/test.yml` — runs the ERT suite on push to `main`, tags `v*`, pull requests, and manual dispatch; installs Emacs + `request` on Ubuntu.
+- `.github/workflows/version-bump.yml` — on same-repo PRs, computes the next version from Conventional Commits and commits `;; Version: X.Y.Z` to `ox-conf.el`; feature commits bump minor, the rest patch, and breaking changes (`!` / `BREAKING CHANGE`) are left for manual versioning.
+- `.github/workflows/auto-release.yml` — when a PR merges to `main`, reads `;; Version:` from `ox-conf.el`, creates `vX.Y.Z` if missing, and publishes a GitHub Release with `ox-conf.el` attached.
+- `.github/workflows/release.yml` — publishes a Release when a `v*` tag is pushed manually.
 - `.github/workflows/opencode.yml` — triggers on issue/PR comments containing `/oc` or `/opencode`; runs an AI agent for code review
 - `.github/workflows/summary.yml` — uses `actions/ai-inference@v1` to auto-summarize new issues and post a comment
+
+The release version lives in the `;; Version:` header of `ox-conf.el`; keep it in sync with any manual tags.

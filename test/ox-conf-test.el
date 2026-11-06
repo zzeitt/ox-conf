@@ -1659,4 +1659,7 @@ list of menus that were shown, in order.  The getter is repeatable."
         (should called)
         (should (eq t upload))))))
 
+(ert-deftest ox-conf-test-org-files-near-tolerates-a-missing-directory ()
+  (should (null (org-conf--org-files-near "/definitely/not/here"))))
+
 ;;; ox-conf-test.el ends here
