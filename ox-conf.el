@@ -500,7 +500,7 @@ holding export options."
 "
                      (mapconcat #'number-to-string numbers ",")
                      _head)
-                  ))
+                  _head))
          (contents (or contents ""))
          )
     (format "%s%s\n"
