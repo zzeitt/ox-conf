@@ -2109,11 +2109,15 @@ Each CHAIN is a root-first list of (:id :title) plists."
       parent)))
 
 (defun org-conf--org-files-near (dir)
-  "Return .org files in DIR and its immediate subdirectories."
-  (append (directory-files dir t "\\.org\\'" t)
-          (cl-loop for sub in (directory-files dir t "\\`[^.]" t)
-                   when (file-directory-p sub)
-                   append (directory-files sub t "\\.org\\'" t))))
+  "Return .org files in DIR and its immediate subdirectories.
+Unreadable directories are skipped, so a restricted sibling (for
+example /tmp/systemd-private-*) cannot break scope inference."
+  (append (ignore-errors (directory-files dir t "\\.org\\'" t))
+          (cl-loop for sub in (ignore-errors
+                                (directory-files dir t "\\`[^.]" t))
+                   when (and sub (file-directory-p sub))
+                   append (ignore-errors
+                            (directory-files sub t "\\.org\\'" t)))))
 
 (defun org-conf--conf-ids-in-directory (dir space)
   "Return up to 8 page ids from .org files near DIR whose CONF_SPACE is SPACE.

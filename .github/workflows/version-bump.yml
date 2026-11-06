@@ -42,8 +42,8 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=200 origin main:refs/remotes/origin/main
 
-          base=$(git show refs/remotes/origin/main:ox-conf.el | grep -m1 '^;; Version:' | sed -E 's/^;; Version:[[:space:]]*//')
-          cur=$(grep -m1 '^;; Version:' ox-conf.el | sed -E 's/^;; Version:[[:space:]]*//')
+          base=$(git show refs/remotes/origin/main:ox-conf.el | grep -m1 '^;; Version:' | sed -E 's/^;; Version:[[:space:]]*//' || true)
+          cur=$(grep -m1 '^;; Version:' ox-conf.el | sed -E 's/^;; Version:[[:space:]]*//' || true)
           echo "base=$base current=$cur"
 
           if [ -z "$base" ] || [ -z "$cur" ]; then
