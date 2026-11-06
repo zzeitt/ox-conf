@@ -1,0 +1,132 @@
+name: version-bump
+
+# `auto-release` 只在 PR 合并时读 ox-conf.el 的 `;; Version:` 打 tag；
+# 这里在 PR 上按 Conventional Commits 算下一个版本，直接改 PR 分支上的
+# ox-conf.el。合并后 auto-release 就会打出新 tag + Release。
+#
+# 版本规则（大版本不自动）：
+#   - 任意提交带 `!`（如 `feat(ox-conf)!:`）或正文含 `BREAKING CHANGE` → 不动，留给人工
+#   - 有 `feat:` → minor（0.1.0 → 0.2.0）
+#   - 其余（fix / perf / refactor / chore / docs / test / ci / build / style）→ patch
+#   - PR 分支上已经手动改过 version（与 main 不同）→ 不动，尊重人工决定
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: write           # push bump 提交到 PR 分支
+  pull-requests: write      # 大版本时在 PR 上留言
+  actions: write            # bump 后重跑 test（GITHUB_TOKEN 的 push 不触发工作流）
+
+# 同一个 PR 的 bump 串行化：快速连推时不要两个 job 抢着改 ox-conf.el
+concurrency:
+  group: version-bump-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    # fork 的 PR 没有写权限，直接跳过（也避免把 token 用在外来分支上）
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: 计算下一个版本号
+        id: calc
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 origin main:refs/remotes/origin/main
+
+          base=$(git show refs/remotes/origin/main:ox-conf.el | grep -m1 '^;; Version:' | sed -E 's/^;; Version:[[:space:]]*//')
+          cur=$(grep -m1 '^;; Version:' ox-conf.el | sed -E 's/^;; Version:[[:space:]]*//')
+          echo "base=$base current=$cur"
+
+          if [ -z "$base" ] || [ -z "$cur" ]; then
+            echo "::notice::读不到 Version 字段，跳过"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # 人工已经 bump 过 → 尊重，不动
+          if [ "$cur" != "$base" ]; then
+            echo "::notice::head 已是 $cur（main 为 $base），视为人工 bump，跳过"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          subjects=$(git log --no-merges --format='%s' refs/remotes/origin/main..HEAD)
+          bodies=$(git log --no-merges --format='%b' refs/remotes/origin/main..HEAD)
+
+          if printf '%s\n' "$subjects" | grep -Eq '^[a-zA-Z]+(\(.+\))?!:' \
+             || printf '%s\n' "$bodies" | grep -q 'BREAKING CHANGE'; then
+            echo "::notice::检测到 breaking change —— 大版本不自动发，请人工决定版本号并改 ox-conf.el"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "major=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          kind=patch
+          if printf '%s\n' "$subjects" | grep -Eq '^feat(\(.+\))?:'; then
+            kind=minor
+          fi
+
+          IFS=. read -r MAJ MIN PAT <<< "$cur"
+          if [ "$kind" = "minor" ]; then MIN=$((MIN + 1)); PAT=0; else PAT=$((PAT + 1)); fi
+          next="$MAJ.$MIN.$PAT"
+          echo "kind=$kind next=$next"
+
+          # 用 python 改，不用 sed：GNU 的 "0,/re/" 地址在 busybox sed 上不支持，
+          # 本地跑一次验证脚本时会静默不生效（踩过）。
+          python3 - "$next" <<'PY'
+          import re, sys
+          new = sys.argv[1]
+          p = "ox-conf.el"
+          s = open(p, encoding="utf-8").read()
+          s2, n = re.subn(r"^;; Version:.*$", f";; Version: {new}", s, count=1, flags=re.M)
+          if n != 1:
+              sys.exit("ox-conf.el 里没有 Version 行")
+          open(p, "w", encoding="utf-8").write(s2)
+          PY
+          got=$(grep -m1 '^;; Version:' ox-conf.el | sed -E 's/^;; Version:[[:space:]]*//')
+          if [ "$got" != "$next" ]; then
+            echo "::error::版本号没改成 $next（实际 $got）"
+            exit 1
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: 大版本时在 PR 留言
+        if: steps.calc.outputs.major == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR" --body "⚠️ 检测到 breaking（大版本）变更，**没有**自动 bump 版本号。
+          合并前请手动改 \`ox-conf.el\` 的 \`;; Version:\`，
+          否则 auto-release 会跳过、不会产生 Release。"
+
+      - name: 提交 bump
+        if: steps.calc.outputs.skip == 'false'
+        env:
+          NEXT: ${{ steps.calc.outputs.next }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ox-conf.el
+          if git diff --cached --quiet; then
+            echo "::notice::没有变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore(release): v${NEXT}"
+          git push origin "HEAD:${BRANCH}"
+
+      - name: 为 bump 提交补一次 test（GITHUB_TOKEN 的 push 不会触发工作流）
+        if: steps.calc.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: gh workflow run test.yml --ref "$BRANCH" || true

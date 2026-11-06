@@ -4,6 +4,8 @@
 
 ;; Author: zeit <zzzeittt at gmail dot com>
 ;; Keywords: convenience
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1") (request "0.3.3"))
 
 ;; This file is NOT part of GNU Emacs.
 

@@ -169,6 +169,15 @@ Debug log:
     ~org-conf-log-max-lines~ caps its size.  The buffer is a read-only
     =special-mode= (Evil normal state, =q= to quit) with ✅/❌ highlighting.
 
+CI & Release:
+  - =test.yml= runs the ERT suite on push / pull request / tag.
+  - =version-bump.yml= bumps =ox-conf.el='s =;; Version:= from
+    Conventional Commits on PRs; breaking changes are left for manual
+    versioning.
+  - =auto-release.yml= tags =vX.Y.Z= when a PR merges and creates a
+    GitHub Release with =ox-conf.el= attached.
+  - =release.yml= creates the Release for manually pushed =v*= tags.
+
 Note:
   Most of the codes in this file are adapted from =ox-html.el=.
   Part of the codes are inspired by =org-jira.el=.
