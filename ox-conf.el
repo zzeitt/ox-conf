@@ -4,7 +4,7 @@
 
 ;; Author: zeit <zzzeittt at gmail dot com>
 ;; Keywords: convenience
-;; Version: 1.2.0
+;; Version: 1.3.0
 ;; Package-Requires: ((emacs "27.1") (request "0.3.3"))
 
 ;; This file is NOT part of GNU Emacs.
@@ -86,7 +86,69 @@
 ;;            org-conf-export-to-conf-without-post
 ;;   - ~f r~: "Forget the wrong password" (REST auth cache only)
 ;;            org-conf-forget-password
+;;   - ~f s~: "Sync: compare with Confluence (ediff)" org-conf-sync
+;;   - ~f a~: "Sync: adopt remote version as baseline" org-conf-sync-adopt
+;;   - ~f h~: "History: ediff a version" org-conf-history
+;;   - ~f m~: "Comments: pull to sidecar" org-conf-comments-pull
+;;   - ~f M~: "Comments: push reply drafts" org-conf-comments-push
 ;;   - ~f l~: "Show debug log" org-conf-show-log
+;;
+;; Sync (M1):
+;;   - ~f s~ compares the buffer with the live page without writing to
+;;     Confluence.  It reports one of synced / remote-ahead / local-ahead
+;;     / diverged / remote-deleted / local-missing, and opens an ediff of
+;;     canonical storage projections when the sides differ.
+;;   - ~f a~ records the current remote version as the baseline.  It
+;;     writes #+CONF_VERSION, #+CONF_REMOTE_HASH, #+CONF_LOCAL_HASH and
+;;     #+CONF_SYNCED_AT, saves a local snapshot under .conf-history/,
+;;     and never writes to the page.
+;;   - Hashes are compared like-for-like only.  Confluence rewrites
+;;     storage on save (it injects ac:macro-id and reorders macro
+;;     parameters), so a local export is never hashed against a fetched
+;;     body; the remote hash is only compared with the previous remote
+;;     hash, and the local org hash with the previous local one.
+;;
+;; History (M3):
+;;   - ~f h~ lists the page's versions and opens a three-way ediff:
+;;     the chosen version, the storage the local org exports, and the
+;;     current remote version.  Historical bodies come from
+;;     content/{id}?status=historical&version=N (the /version/N endpoint
+;;     404s on Server 8.x).  Versions already in .conf-history/ are
+;;     reused instead of being stored twice.
+;;
+;; Markers (M4):
+;;   - Before a PUT, the page's existing
+;;     <ac:inline-comment-marker ac:ref="..."> anchors are re-wrapped
+;;     around the same text in the new export, so inline threads stay
+;;     anchored.
+;;   - A marker whose text matches zero or several times is ambiguous.
+;;     `org-conf-marker-loss-policy' decides: error (default) refuses to
+;;     publish, warn publishes with a warning, allow publishes silently.
+;;   - Markers whose text spans inline markup that the export renders
+;;     differently cannot be re-anchored; they are reported as ambiguous
+;;     rather than skipped silently.
+;;   - If the live body cannot be read, the last adopted snapshot is
+;;     consulted: when it still has markers and the policy is error,
+;;     publishing is refused instead of proceeding blind.
+;;
+;; Comments (M2):
+;;   - ~f m~ pulls every comment thread into
+;;     .conf-comments/<pageId>.org, one heading per thread with
+;;     CONF_COMMENT_ID / CONF_PARENT_ID / CONF_MARKER_REF / CONF_STATUS /
+;;     CONF_ANCHOR_TEXT / CONF_AUTHOR / CONF_CREATED properties.  Replies
+;;     are grouped by parentId; a thread whose marker is gone is marked
+;;     dangling and only warned about.
+;;   - Add a ~**~ child under a thread and run ~f M~ to post it as a
+;;     reply (--parent only; Server 8.x rejects inline metadata).  The
+;;     returned comment id is written back and the local status becomes
+;;     answered.  Server has no resolve endpoint, so nothing claims a
+;;     remote resolution.
+;;   - Known limits: deleting an inline root comment with
+;;     `comment-delete' leaves an orphan <ac:inline-comment-marker> in
+;;     the body (commentCount is 0 but the marker remains); removing it
+;;     needs one body update, which ox-conf does not automate.
+;;     ~f M~ must run from the source org buffer: the sidecar has no
+;;     #+CONF_ID, so running it there errors explicitly.
 ;;
 ;; Response:
 ;;   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
@@ -158,6 +220,36 @@
 ;;                 keeps the old CONF block as a comment (one active ID).
 ;;   - 2026-10-28: A newly created page is confirmed before upload too;
 ;;                 declining leaves that empty page and stops.
+;;   - 2026-11-12: Sync M1: `f s' detects remote/local drift with
+;;                 #+CONF_VERSION/REMOTE_HASH/LOCAL_HASH watermarks and
+;;                 opens a canonical ediff; `f a' adopts the current
+;;                 remote version as the baseline.  Snapshots live under
+;;                 .conf-history/<pageId>/ with a 20-version retention.
+;;                 A successful publish refreshes the baseline
+;;                 automatically, and the ediff projection drops
+;;                 server-injected macro attributes so an in-sync page
+;;                 shows no spurious diff.
+;;   - 2026-11-12: Sync M3: `f h' picks a historical version and opens
+;;                 a three-way ediff (version / local export / current
+;;                 remote).  Historical bodies are fetched through
+;;                 status=historical and cached in .conf-history/ so a
+;;                 version already snapshotted is never fetched twice.
+;;   - 2026-11-12: Sync M4: inline comment markers are re-injected before
+;;                 a PUT, so publishing no longer orphans inline threads.
+;;                 `org-conf-marker-loss-policy' aborts by default when
+;;                 an anchor cannot be restored; warn/allow downgrade it.
+;;   - 2026-11-12: Sync M2: `f m' pulls comment threads into a sidecar
+;;                 org file; `f M' posts reply drafts with --parent and
+;;                 writes the returned comment id back.  Marker
+;;                 protection now fails closed when the live body cannot
+;;                 be read but the last snapshot still has anchors.
+;;   - 2026-11-13: Added ERT coverage for the export-layer transcoders
+;;                 (src-block language mapping and Jira macros, special
+;;                 blocks, headline numbering, TOC, tags, LaTeX and
+;;                 export-block filters, links, targets, center blocks).
+;;                 Fixed the 修改 tag colour ("Yello" -> "Yellow") and
+;;                 external links losing their scheme (https://x became
+;;                 //x).
 
 
 ;;; Code:
@@ -465,7 +557,7 @@ holding export options."
 "
                 ;; color
                 (cond ((string= "新增" tag) "Green")
-                      ((string= "修改" tag) "Yello")
+                      ((string= "修改" tag) "Yellow")
                       ((string= "删除" tag) "Red")
                       ((string= "复制" tag) "Blue")
                       (t "Grey")
@@ -918,6 +1010,11 @@ Givne filename as SOURCE, org-inlined ATTRIBUTES and export INFO."
   (let* ((path (org-element-property :path link))
          ;; (attributes-plist (org-export-read-attribute :attr_html link))
          (type (org-element-property :type link))
+         ;; `path' alone drops the scheme for [[https://…]]; keep the
+         ;; raw link for scheme-bearing external links.
+         (href (if (member type '("http" "https" "mailto" "ftp"))
+                   (org-element-property :raw-link link)
+                 path))
            (file-title (org-export-data (plist-get info :title) info))
          (attributes-plist
           (org-combine-plists
@@ -987,13 +1084,13 @@ Givne filename as SOURCE, org-inlined ATTRIBUTES and export INFO."
      ;; External link with a description part.
      ((and path desc)
       (format "<a href=\"%s\">%s</a>"
-              (org-html-encode-plain-text path)
+              (org-html-encode-plain-text href)
               desc))
      ;; External link without a description part.
      (path
       (format "<a href=\"%s\">%s</a>"
-              (org-html-encode-plain-text path)
-              path))
+              (org-html-encode-plain-text href)
+              (org-html-encode-plain-text href)))
      )))
 
 (defun org-conf-target (target _contents info)
@@ -1990,7 +2087,1168 @@ Ask for confirmation when an attachment with the same name exists."
           (message "===> Image info: title is %s, ID is %s." cur-title cur-id))))))
 
 ;;; ======================================================================
-;;;                          Export Functions                             
+;;;                     Sync: hashes and watermarks
+;;; ======================================================================
+
+(defun org-conf--sha256-string (text)
+  "Return the SHA-256 of TEXT as a lowercase hex string.
+TEXT is UTF-8 encoded first, so the digest does not depend on how the
+buffer happens to store its characters."
+  (secure-hash 'sha256 (encode-coding-string (or text "") 'utf-8-unix)))
+
+(defun org-conf--normalize-org-text (text)
+  "Return TEXT normalized for sync hashing.
+A leading BOM is dropped, CRLF and lone CR become LF, trailing blanks
+on each line are removed, a missing final newline is added, and every
+#+CONF_* keyword line is removed.  Dropping the CONF lines is what lets
+the sync rewrite its own watermarks without making the local hash dirty."
+  (let ((s (or text "")))
+    (when (string-prefix-p (char-to-string #xFEFF) s)
+      (setq s (substring s 1)))
+    (setq s (replace-regexp-in-string "\r\n?" "\n" s))
+    (setq s (replace-regexp-in-string "^#\\+CONF_[A-Z_]+:.*\n?" "" s))
+    (setq s (replace-regexp-in-string "[[:blank:]]+\n" "\n" s))
+    (setq s (replace-regexp-in-string "[[:blank:]]+\\'" "" s))
+    (setq s (replace-regexp-in-string "\n+\\'" "\n" s))
+    (cond ((string-empty-p s) "")
+          ((string-suffix-p "\n" s) s)
+          (t (concat s "\n")))))
+
+(defun org-conf--sync-state (s)
+  "Return the sync state for S, a plist describing one page.
+Required keys:
+
+  :conf-id          the page id from #+CONF_ID (nil when unlinked)
+  :conf-version     #+CONF_VERSION, the last synced remote version
+  :conf-local-hash  #+CONF_LOCAL_HASH, local org hash at that sync
+  :conf-remote-hash #+CONF_REMOTE_HASH, remote body hash at that sync
+  :local-hash       current normalized local org hash
+  :remote-version   current remote version
+  :remote-hash      current remote storage body hash
+  :remote-exists    nil when Confluence reports the page is gone
+
+Return a plist (:state STATE :reason STRING :local-dirty BOOL
+:remote-changed BOOL :version-advanced BOOL).  STATE is one of
+`synced', `remote-ahead', `local-ahead', `diverged', `remote-deleted'
+or `local-missing'.
+
+Hashes are only ever compared like-for-like: the local hash against the
+local hash recorded at the last sync, and the remote body hash against
+the remote body hash recorded then.  Confluence rewrites storage on
+save (it injects `ac:macro-id' and reorders macro parameters), so a raw
+local export is never compared with a fetched body.
+
+A new remote version whose body hash did not change (an empty save by
+somebody else) is therefore `synced', not `remote-ahead'."
+  (let* ((conf-id (plist-get s :conf-id))
+         (conf-version (plist-get s :conf-version))
+         (conf-local (plist-get s :conf-local-hash))
+         (conf-remote (plist-get s :conf-remote-hash))
+         (local (plist-get s :local-hash))
+         (remote-version (plist-get s :remote-version))
+         (remote (plist-get s :remote-hash))
+         (remote-exists (plist-get s :remote-exists))
+         (local-dirty (not (and conf-local (equal local conf-local))))
+         (remote-changed (not (and conf-remote (equal remote conf-remote))))
+         (version-advanced (and conf-version remote-version
+                                (> remote-version conf-version))))
+    (list :state
+          (cond
+           ((not conf-id) 'local-missing)
+           ((null remote-exists) 'remote-deleted)
+           ((or (null conf-version) (null conf-remote)) 'diverged)
+           ((and (not local-dirty) (not remote-changed)) 'synced)
+           ((and (not local-dirty) remote-changed) 'remote-ahead)
+           ((and local-dirty (not remote-changed)) 'local-ahead)
+           (t 'diverged))
+          :reason
+          (cond
+           ((not conf-id) "no #+CONF_ID")
+           ((null remote-exists) "remote page is gone")
+           ((or (null conf-version) (null conf-remote)) "no sync baseline")
+           ((and (not local-dirty) (not remote-changed)) "up to date")
+           ((and (not local-dirty) remote-changed) "remote body changed")
+           ((and local-dirty (not remote-changed)) "local org changed")
+           (t "both sides changed"))
+          :local-dirty local-dirty
+          :remote-changed remote-changed
+          :version-advanced version-advanced)))
+
+(defun org-conf--option-integer (value)
+  "Return VALUE parsed as an integer, or nil unless it is all digits."
+  (let ((text (and value (string-trim value))))
+    (when (and text (string-match-p "\\`[0-9]+\\'" text))
+      (string-to-number text))))
+
+(defun org-conf--sync-watermarks ()
+  "Return the sync watermark plist for the current buffer."
+  (let ((info (org-export--get-inbuffer-options 'org-conf-html)))
+    (list :conf-id (plist-get info :conf-id)
+          :conf-version (org-conf--option-integer (plist-get info :conf-version))
+          :conf-remote-hash (plist-get info :conf-remote-hash)
+          :conf-local-hash (plist-get info :conf-local-hash)
+          :conf-synced-at (plist-get info :conf-synced-at))))
+
+(defun org-conf--set-keywords (keywords)
+  "Set #+NAME: VALUE keywords in the current buffer.
+KEYWORDS is an alist of (NAME . VALUE), where NAME is the upper-case
+keyword without the leading #+.  Existing lines are updated in place;
+missing ones are inserted together at the end of the leading keyword
+block, preserving the order given."
+  (save-excursion
+    (let ((missing nil))
+      (dolist (kv keywords)
+        (goto-char (point-min))
+        (if (re-search-forward (format "^#\\+%s:.*$" (regexp-quote (car kv)))
+                               nil t)
+            (replace-match (format "#+%s: %s" (car kv) (cdr kv)) t t)
+          (push kv missing)))
+      (when missing
+        (goto-char (org-conf--keyword-block-end))
+        (unless (or (bobp) (eq (char-before) ?\n))
+          (insert "\n"))
+        (insert (mapconcat (lambda (kv) (format "#+%s: %s" (car kv) (cdr kv)))
+                           (nreverse missing) "\n")
+                "\n")))))
+
+(defcustom org-conf-canonical-dropped-attributes
+  '("ac:macro-id" "ac:schema-version")
+  "Attributes removed from the canonical diff projection.
+Confluence injects these when it stores a page, so keeping them would
+show a spurious diff on every macro.  This affects display only: hashes
+and publishing are untouched."
+  :type '(repeat string)
+  :group 'org-export-conf)
+
+(defun org-conf--tag-attribute (tag name)
+  "Return the value of attribute NAME in TAG, or nil."
+  (when (string-match (format "%s=\"\\([^\"]*\\)\"" (regexp-quote name)) tag)
+    (match-string 1 tag)))
+
+(defun org-conf--canonicalize-tag (tag)
+  "Return TAG, a single <...> token, with its attributes sorted by name.
+Attributes listed in `org-conf-canonical-dropped-attributes' are
+removed.  If any attribute cannot be parsed (single quotes or no
+quotes), TAG is returned unchanged so a real difference is never
+hidden."
+  (if (string-match "\\`<\\(/?\\)\\([^ \t\n/>]+\\)\\([^>]*?\\)\\(/?>\\)\\'" tag)
+      (let* ((close (match-string 1 tag))
+             (name (match-string 2 tag))
+             (attrs (match-string 3 tag))
+             (tail (match-string 4 tag))
+             (pairs nil))
+        (while (string-match "\\([^ \t\n=]+\\)=\"\\([^\"]*\\)\"" attrs)
+          (let ((attribute (match-string 1 attrs))
+                (value (match-string 2 attrs)))
+            (unless (member attribute org-conf-canonical-dropped-attributes)
+              (push (cons attribute value) pairs)))
+          (setq attrs (substring attrs (match-end 0))))
+        (if (not (string-empty-p (string-trim attrs)))
+            tag
+          (format "<%s%s%s%s"
+                  close name
+                  (if pairs
+                      (concat " "
+                              (mapconcat
+                               (lambda (pair)
+                                 (format "%s=\"%s\"" (car pair) (cdr pair)))
+                               (sort pairs
+                                     (lambda (a b) (string< (car a) (car b))))
+                               " "))
+                    "")
+                  tail)))
+    tag))
+
+(defun org-conf--split-macro-block (lines)
+  "Split LINES at the first balanced structured-macro block.
+Return (BLOCK . REST); BLOCK includes both the opening and closing
+lines.  A self-closing macro counts as a one-line block."
+  (let ((depth 0) (block nil) (rest lines) (done nil))
+    (while (and rest (not done))
+      (let ((line (car rest)))
+        (push line block)
+        (setq rest (cdr rest))
+        (cond
+         ((and (string-prefix-p "<ac:structured-macro" line)
+               (string-suffix-p "/>" line))
+          (setq done t))
+         ((string-prefix-p "</ac:structured-macro>" line)
+          (setq depth (1- depth))
+          (when (<= depth 0) (setq done t)))
+         ((string-prefix-p "<ac:structured-macro" line)
+          (setq depth (1+ depth))))))
+    (cons (nreverse block) rest)))
+
+(defun org-conf--split-parameter-block (lines)
+  "Split LINES at the first parameter block.
+Return (BLOCK . REST); BLOCK includes both boundary lines."
+  (let ((block nil) (rest lines) (done nil))
+    (while (and rest (not done))
+      (let ((line (car rest)))
+        (push line block)
+        (setq rest (cdr rest))
+        (when (or (string-prefix-p "</ac:parameter>" line)
+                  (and (string-prefix-p "<ac:parameter" line)
+                       (string-suffix-p "/>" line)))
+          (setq done t))))
+    (cons (nreverse block) rest)))
+
+(defun org-conf--empty-parameter-block-p (block)
+  "Non-nil when BLOCK is an ac:parameter whose body is blank.
+Confluence drops such parameters when it stores the page."
+  (let ((inner (butlast (cdr block))))
+    (or (null inner)
+        (cl-every (lambda (line) (string-empty-p (string-trim line))) inner))))
+
+(defun org-conf--sorted-macro-block (block)
+  "Return BLOCK with its direct parameter children sorted by ac:name.
+Empty parameters are dropped, and macros nested in the remaining body
+are sorted recursively."
+  (if (< (length block) 3)
+      block
+    (let* ((head (car block))
+           (tail (car (last block)))
+           (body (butlast (cdr block)))
+           (params nil)
+           (others nil)
+           (rest body))
+      (while rest
+        (if (string-prefix-p "<ac:parameter" (car rest))
+            (let* ((split (org-conf--split-parameter-block rest))
+                   (pblock (car split)))
+              (setq rest (cdr split))
+              (unless (org-conf--empty-parameter-block-p pblock)
+                (push (cons (or (org-conf--tag-attribute (car pblock) "ac:name") "")
+                            pblock)
+                      params)))
+          (push (car rest) others)
+          (setq rest (cdr rest))))
+      (append (list head)
+              (apply #'append
+                     (mapcar #'cdr
+                             (sort params
+                                   (lambda (a b) (string< (car a) (car b))))))
+              (org-conf--sort-macro-parameters (nreverse others))
+              (list tail)))))
+
+(defun org-conf--sort-macro-parameters (lines)
+  "Sort parameter children by ac:name inside every macro block in LINES."
+  (let ((out nil) (rest lines))
+    (while rest
+      (if (string-prefix-p "<ac:structured-macro" (car rest))
+          (let ((split (org-conf--split-macro-block rest)))
+            (setq out (nconc out (org-conf--sorted-macro-block (car split))))
+            (setq rest (cdr split)))
+        (setq out (nconc out (list (car rest))))
+        (setq rest (cdr rest))))
+    out))
+
+(defun org-conf--canonicalize-storage (storage)
+  "Return STORAGE as deterministic, one-token-per-line text for ediff.
+Tags get their own line with attributes sorted by name; text runs
+collapse internal whitespace; CRLF becomes LF.  This is a display
+projection only -- it is never converted back to org or published.
+
+Tag boundaries are found with a simple \"<...>\" scan, so a literal
+`>' inside a quoted attribute value would split early.  Confluence
+storage escapes those as `&gt;' in practice."
+  (let ((s (replace-regexp-in-string "\r\n?" "\n" (or storage "")))
+        (pos 0)
+        (tokens nil))
+    (while (string-match "<[^>]*>" s pos)
+      (let ((start (match-beginning 0))
+            (end (match-end 0)))
+        (when (< pos start)
+          (push (cons 'text (substring s pos start)) tokens))
+        (push (cons 'tag (substring s start end)) tokens)
+        (setq pos end)))
+    (when (< pos (length s))
+      (push (cons 'text (substring s pos)) tokens))
+    (mapconcat
+     #'identity
+     (org-conf--sort-macro-parameters
+      (delq nil
+            (mapcar
+             (lambda (token)
+               (if (eq (car token) 'tag)
+                   (org-conf--canonicalize-tag (cdr token))
+                 (let ((text (string-trim
+                              (replace-regexp-in-string
+                               "[[:space:]]+" " " (cdr token)))))
+                   (unless (string-empty-p text) text))))
+             (nreverse tokens))))
+     "\n")))
+
+;;; ----------------------------------------------------------------------
+;;; Sync: Confluence CLI transport (non-signalling) and page plists.
+;;; ----------------------------------------------------------------------
+
+(defun org-conf--cli-parse-result (status output stderr)
+  "Turn one CLI run into a result plist.
+Success is (:ok t :data DATA).  Failure is
+\(:ok nil :status HTTP-STATUS :code CODE :message MESSAGE), where
+HTTP-STATUS and CODE are nil when stderr is not the CLI's JSON error.
+A successful run with unparseable stdout yields code \"INVALID_JSON\"."
+  (if (and (integerp status) (zerop status))
+      (condition-case err
+          (list :ok t
+                :data
+                (with-temp-buffer
+                  (insert output)
+                  (goto-char (point-min))
+                  (json-parse-buffer :object-type 'alist
+                                     :array-type 'list
+                                     :null-object nil
+                                     :false-object nil)))
+        (error (list :ok nil :status nil :code "INVALID_JSON"
+                     :message (error-message-string err))))
+    (let* ((text (string-trim stderr))
+           (parsed (ignore-errors
+                     (json-parse-string text
+                                        :object-type 'alist
+                                        :null-object nil
+                                        :false-object nil))))
+      (list :ok nil
+            :status (and (consp parsed) (alist-get 'status parsed))
+            :code (and (consp parsed) (alist-get 'code parsed))
+            :message (cond ((consp parsed)
+                            (or (alist-get 'error parsed) text))
+                           ((stringp parsed) parsed)
+                           (t text))))))
+
+(defun org-conf--cli-json-safe (&rest args)
+  "Run the Confluence CLI with ARGS, returning a result without signalling.
+This is the non-signalling counterpart of `org-conf--cli-json'; the
+caller decides whether a 404 means \"page deleted\" or an error."
+  (let* ((coding-system-for-read 'utf-8-unix)
+         (coding-system-for-write 'utf-8-unix)
+         (program (org-conf--cli-program))
+         (stderr (make-temp-file "ox-conf-cli-err-"))
+         status output err)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (setq status (apply #'call-process program nil
+                                (list (current-buffer) stderr) nil
+                                "--json" args))
+            (setq output (buffer-string)))
+          (with-temp-buffer
+            (when (file-readable-p stderr)
+              (insert-file-contents stderr))
+            (setq err (buffer-string)))
+          (org-conf--cli-parse-result status output err))
+      (delete-file stderr))))
+
+(defun org-conf--page-json-to-plist (json)
+  "Return the sync facts from a page JSON object.
+The result has :ok, :version, :storage, :hash, :title, :space, :status."
+  (let* ((storage (alist-get 'value
+                             (alist-get 'storage (alist-get 'body json))))
+         (storage (or storage "")))
+    (list :ok t
+          :version (alist-get 'number (alist-get 'version json))
+          :storage storage
+          :hash (org-conf--sha256-string storage)
+          :title (alist-get 'title json)
+          :space (alist-get 'key (alist-get 'space json))
+          :status (alist-get 'status json))))
+
+(defun org-conf--cli-fetch-page (endpoint)
+  "Fetch ENDPOINT and return a page plist.
+A 404 becomes (:ok nil :status 404 :code \"NOT_FOUND\"), so the state
+machine can report a deleted page instead of raising."
+  (let ((res (org-conf--cli-json-safe "api" endpoint)))
+    (cond
+     ((plist-get res :ok) (org-conf--page-json-to-plist (plist-get res :data)))
+     ((equal (plist-get res :status) 404)
+      (list :ok nil :status 404 :code "NOT_FOUND"))
+     (t
+      (user-error "Confluence request failed (%s): %s"
+                  (or (plist-get res :status) "unknown")
+                  (plist-get res :message))))))
+
+(defun org-conf-cli-get-current-body (page-id)
+  "Return PAGE-ID's current page plist via `confluence api'."
+  (org-conf--cli-fetch-page
+   (format "content/%s?expand=body.storage,version,space" page-id)))
+
+(defun org-conf-cli-get-version-body (page-id version)
+  "Return PAGE-ID at historical VERSION via `confluence api'."
+  (org-conf--cli-fetch-page
+   (format "content/%s?status=historical&version=%s&expand=body.storage,version"
+           page-id version)))
+
+(defun org-conf-cli-list-versions (page-id)
+  "Return PAGE-ID's versions as plists via `confluence versions'."
+  (let ((res (org-conf--cli-json-safe "versions" page-id)))
+    (unless (plist-get res :ok)
+      (user-error "Confluence versions failed: %s" (plist-get res :message)))
+    (mapcar (lambda (version)
+              (list :number (alist-get 'number version)
+                    :when (alist-get 'when version)
+                    :by (alist-get 'by version)
+                    :minor-edit (alist-get 'minorEdit version)
+                    :message (alist-get 'message version)))
+            (alist-get 'versions (plist-get res :data)))))
+
+;;; ----------------------------------------------------------------------
+;;; Sync: local snapshot store.
+;;; ----------------------------------------------------------------------
+
+(defcustom org-conf-history-directory nil
+  "Where sync snapshots are stored.
+nil means a `.conf-history' directory next to the current org file."
+  :type '(choice (const :tag "Next to the org file" nil) directory)
+  :group 'org-export-conf)
+
+(defcustom org-conf-history-retain 20
+  "How many snapshots to keep per page."
+  :type 'integer
+  :group 'org-export-conf)
+
+(defun org-conf--history-dir (page-id)
+  "Return the snapshot directory for PAGE-ID.
+The base is `org-conf-history-directory', or `.conf-history' next to
+the current org file when the option is nil."
+  (expand-file-name
+   (format "%s" page-id)
+   (or org-conf-history-directory
+       (expand-file-name
+        ".conf-history"
+        (or (and buffer-file-name
+                 (file-name-directory buffer-file-name))
+            default-directory)))))
+
+(defun org-conf--snapshot-path (page-id version)
+  "Return the snapshot file for PAGE-ID at VERSION."
+  (expand-file-name (format "v%s.storage.xhtml" version)
+                    (org-conf--history-dir page-id)))
+
+(defun org-conf--snapshot-write (page-id version storage)
+  "Write STORAGE as the snapshot for PAGE-ID at VERSION.
+Return the file name."
+  (let ((file (org-conf--snapshot-path page-id version))
+        (coding-system-for-write 'utf-8-unix))
+    (make-directory (file-name-directory file) t)
+    (with-temp-file file
+      (insert (or storage "")))
+    file))
+
+(defun org-conf--snapshot-read (page-id version)
+  "Return the stored storage body for PAGE-ID at VERSION, or nil."
+  (let ((file (org-conf--snapshot-path page-id version)))
+    (when (file-readable-p file)
+      (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8-unix))
+          (insert-file-contents file))
+        (buffer-string)))))
+
+(defun org-conf--snapshot-versions (page-id)
+  "Return the snapshot versions present for PAGE-ID, newest first."
+  (let ((dir (org-conf--history-dir page-id)))
+    (when (file-directory-p dir)
+      (sort
+       (delq nil
+             (mapcar (lambda (name)
+                       (when (string-match
+                              "\\`v\\([0-9]+\\)\\.storage\\.xhtml\\'" name)
+                         (string-to-number (match-string 1 name))))
+                     (directory-files dir nil nil t)))
+       #'>))))
+
+(defun org-conf--snapshot-prune (page-id)
+  "Delete all but the newest `org-conf-history-retain' snapshots."
+  (dolist (version (nthcdr org-conf-history-retain
+                           (org-conf--snapshot-versions page-id)))
+    (ignore-errors (delete-file (org-conf--snapshot-path page-id version)))))
+
+;;; ----------------------------------------------------------------------
+;;; Sync: local facts, collection and baseline adoption.
+;;; ----------------------------------------------------------------------
+
+(defun org-conf--current-local-hash ()
+  "Return the normalized SHA-256 of the whole buffer, narrowed or not.
+Hashing only the accessible portion would make `f s' in a narrowed
+buffer compare a subtree against the full-document watermark."
+  (save-restriction
+    (widen)
+    (org-conf--sha256-string
+     (org-conf--normalize-org-text
+      (buffer-substring-no-properties (point-min) (point-max))))))
+
+(defun org-conf--current-local-body ()
+  "Return the storage body the current buffer would publish.
+Attachments are not uploaded; this is a pure export."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (let ((watermarks (org-conf--sync-watermarks)))
+        (org-export-as 'org-conf-html nil nil nil
+                       (list :org-conf-do-post nil
+                             :org-conf-id (plist-get watermarks :conf-id)))))))
+
+(defun org-conf--sync-collect ()
+  "Return the sync facts for the current buffer.
+Keys: :watermarks, :local-hash, :remote and :state.  :remote is nil
+when the buffer has no #+CONF_ID or the page is gone.
+
+No export is performed here: the state machine only compares
+like-for-like hashes, so this command is cheap enough to run often."
+  (let* ((watermarks (org-conf--sync-watermarks))
+         (conf-id (plist-get watermarks :conf-id))
+         (local-hash (org-conf--current-local-hash))
+         (remote (when conf-id (org-conf-cli-get-current-body conf-id)))
+         (state (org-conf--sync-state
+                 (append watermarks
+                         (list :local-hash local-hash
+                               :remote-version (plist-get remote :version)
+                               :remote-hash (plist-get remote :hash)
+                               :remote-exists (if remote
+                                                  (plist-get remote :ok)
+                                                nil))))))
+    (list :watermarks watermarks
+          :local-hash local-hash
+          :remote remote
+          :state state)))
+
+(defun org-conf--sync-adopt (watermarks remote)
+  "Record REMOTE as the synced baseline in the current buffer.
+WATERMARKS is the buffer's current watermark plist.  This writes only
+`#+CONF_*' lines and the local snapshot; Confluence is never touched."
+  (let ((conf-id (plist-get watermarks :conf-id)))
+    (org-conf--set-keywords
+     `(("CONF_VERSION" . ,(number-to-string (plist-get remote :version)))
+       ("CONF_REMOTE_HASH" . ,(plist-get remote :hash))
+       ("CONF_LOCAL_HASH" . ,(org-conf--current-local-hash))
+       ("CONF_SYNCED_AT" . ,(format-time-string "%Y-%m-%dT%H:%M:%S%z"))))
+    (org-conf--snapshot-write conf-id
+                              (plist-get remote :version)
+                              (plist-get remote :storage))
+    (org-conf--snapshot-prune conf-id)))
+
+(defcustom org-conf-sync-adopt-after-publish t
+  "Whether a successful publish refreshes the sync watermarks.
+When non-nil, the page is fetched once more after a successful PUT and
+recorded as the baseline.  This second read is required because
+Confluence rewrites storage on save (it injects `ac:macro-id' and
+reorders macro parameters), so the body we sent is not the body to
+hash."
+  :type 'boolean
+  :group 'org-export-conf)
+
+(defun org-conf--maybe-adopt-after-publish ()
+  "Refresh the sync watermarks from the live page after a publish.
+Does nothing when `org-conf-sync-adopt-after-publish' is nil, when the
+buffer has no #+CONF_ID, or when the page cannot be read back.  This
+never signals: a failed refresh must not turn a successful publish into
+an error."
+  (when org-conf-sync-adopt-after-publish
+    (let* ((watermarks (org-conf--sync-watermarks))
+           (conf-id (plist-get watermarks :conf-id)))
+      (when conf-id
+        (condition-case err
+            (let ((remote (org-conf-cli-get-current-body conf-id)))
+              (if (plist-get remote :ok)
+                  (progn
+                    (org-conf--sync-adopt watermarks remote)
+                    (message "Sync baseline refreshed to v%s (save the buffer)."
+                             (plist-get remote :version)))
+                (message "Published, but page %s could not be read back (%s); sync watermark not updated."
+                         conf-id (or (plist-get remote :code) "error"))))
+          (error
+           (message "Published, but refreshing the sync watermark failed: %s"
+                    (error-message-string err))))))))
+
+(defun org-conf--snapshot-ensure (page-id version)
+  "Return VERSION's storage for PAGE-ID, fetching it if not snapshotted.
+An existing snapshot wins, so a baseline written by `f a' is not fetched
+twice.  Newly fetched versions are stored and retention applied."
+  (or (org-conf--snapshot-read page-id version)
+      (let ((page (org-conf-cli-get-version-body page-id version)))
+        (unless (plist-get page :ok)
+          (user-error "Version %s of page %s is unavailable"
+                      version page-id))
+        (org-conf--snapshot-write page-id version (plist-get page :storage))
+        (org-conf--snapshot-prune page-id)
+        (plist-get page :storage))))
+
+(defun org-conf--version-choices (versions)
+  "Return `completing-read' choices for VERSIONS, newest first.
+Each choice is (DISPLAY . VERSION-NUMBER)."
+  (mapcar (lambda (version)
+            (let ((message (plist-get version :message)))
+              (cons (format "v%s  %s  %s%s"
+                            (plist-get version :number)
+                            (plist-get version :when)
+                            (plist-get version :by)
+                            (if (or (null message) (string-empty-p message))
+                                ""
+                              (format "  — %s" message)))
+                    (plist-get version :number))))
+          (sort (copy-sequence versions)
+                (lambda (a b) (> (plist-get a :number)
+                                 (plist-get b :number))))))
+
+(defun org-conf-history-show (page-id version)
+  "Open a three-way ediff for PAGE-ID at VERSION.
+The three buffers are: the historical version, the storage the local
+org exports, and the current remote version.  All are canonical
+projections; Confluence is never written."
+  (let* ((historical (org-conf--canonicalize-storage
+                      (org-conf--snapshot-ensure page-id version)))
+         (remote (org-conf-cli-get-current-body page-id))
+         (local (org-conf--canonicalize-storage
+                 (org-conf--current-local-body))))
+    (unless (plist-get remote :ok)
+      (user-error "Current page %s is unavailable" page-id))
+    (let ((base-file (org-conf--write-diff-file
+                      (format "v%s" version) historical))
+          (local-file (org-conf--write-diff-file "local" local))
+          (remote-file (org-conf--write-diff-file
+                        "remote"
+                        (org-conf--canonicalize-storage
+                         (plist-get remote :storage)))))
+      (message "Comparing v%s with local and the current v%s"
+               version (plist-get remote :version))
+      (ediff-files3 base-file local-file remote-file))))
+
+(defun org-conf-history ()
+  "Pick a historical version and ediff it against local and remote."
+  (interactive)
+  (let* ((watermarks (org-conf--sync-watermarks))
+         (conf-id (plist-get watermarks :conf-id)))
+    (unless conf-id
+      (user-error "No #+CONF_ID in this buffer"))
+    (let ((versions (org-conf-cli-list-versions conf-id)))
+      (unless versions
+        (user-error "No versions returned for page %s" conf-id))
+      (let* ((choices (org-conf--version-choices versions))
+             (picked (completing-read "Version: " choices nil t)))
+        (org-conf-history-show conf-id (cdr (assoc picked choices)))))))
+
+(defun org-conf--write-diff-file (label text)
+  "Write TEXT to a fresh UTF-8 temp file named for LABEL.
+Return the file name."
+  (let ((file (make-temp-file (format "ox-conf-%s-" label) nil ".txt"))
+        (coding-system-for-write 'utf-8-unix))
+    (with-temp-file file
+      (insert (or text "")))
+    file))
+
+(defun org-conf--sync-show (collected &optional with-base)
+  "Open an ediff for COLLECTED.
+The buffers are canonical, read-only projections of the storage bodies.
+When WITH-BASE is non-nil and a snapshot of #+CONF_VERSION exists, the
+ediff is three-way: base snapshot, local export, remote."
+  (let* ((watermarks (plist-get collected :watermarks))
+         (conf-id (plist-get watermarks :conf-id))
+         (conf-version (plist-get watermarks :conf-version))
+         (local (org-conf--canonicalize-storage
+                 (org-conf--current-local-body)))
+         (remote (org-conf--canonicalize-storage
+                  (plist-get (plist-get collected :remote) :storage)))
+         (base (and with-base conf-version
+                    (org-conf--snapshot-read conf-id conf-version)))
+         (local-file (org-conf--write-diff-file "local" local))
+         (remote-file (org-conf--write-diff-file "remote" remote)))
+    (if base
+        (ediff-files3 (org-conf--write-diff-file
+                       "base" (org-conf--canonicalize-storage base))
+                      local-file remote-file)
+      (ediff-files local-file remote-file))))
+
+(defun org-conf-sync ()
+  "Compare the current org buffer with its Confluence page.
+Read-only with respect to Confluence: it fetches the remote version,
+reports the sync state, and opens an ediff when the two sides differ.
+Use `org-conf-sync-adopt' to record the remote version as the baseline."
+  (interactive)
+  (let* ((collected (org-conf--sync-collect))
+         (state (plist-get collected :state))
+         (kind (plist-get state :state))
+         (remote (plist-get collected :remote)))
+    (pcase kind
+      ('local-missing
+       (user-error "No #+CONF_ID in this buffer; nothing to sync"))
+      ('remote-deleted
+       (user-error "Confluence page %s is gone (404)"
+                   (plist-get (plist-get collected :watermarks) :conf-id)))
+      ('synced
+       (message "Already in sync%s"
+                (if (plist-get state :version-advanced)
+                    (format " (remote is v%s; only a watermark update is due, run `f a')"
+                            (plist-get remote :version))
+                  (format " at v%s" (plist-get remote :version)))))
+      ('local-ahead
+       (message "Local org changed; publish with `f f'"))
+      ('remote-ahead
+       (org-conf--sync-show collected)
+       (message "Remote moved ahead to v%s; ediff opened.  Run `f a' to adopt it as the baseline."
+                (plist-get remote :version)))
+      ('diverged
+       (org-conf--sync-show collected t)
+       (message "Both sides changed; ediff opened.  Resolve before publishing."))
+      (_ (message "Sync state: %s" kind)))))
+
+(defun org-conf-sync-adopt ()
+  "Record the current remote version as the sync baseline.
+Writes only the buffer's #+CONF_* watermarks and a local snapshot; it
+never writes to Confluence."
+  (interactive)
+  (let* ((watermarks (org-conf--sync-watermarks))
+         (conf-id (plist-get watermarks :conf-id)))
+    (unless conf-id
+      (user-error "No #+CONF_ID in this buffer"))
+    (let ((remote (org-conf-cli-get-current-body conf-id)))
+      (unless (plist-get remote :ok)
+        (user-error "Confluence page %s is gone" conf-id))
+      (org-conf--sync-adopt watermarks remote)
+      (message "Recorded v%s as the sync baseline; save the buffer."
+               (plist-get remote :version)))))
+
+;;; ----------------------------------------------------------------------
+;;; M4: inline comment anchors.
+;;; ----------------------------------------------------------------------
+
+(defcustom org-conf-marker-loss-policy 'error
+  "What to do when publishing would drop inline comment anchors.
+`error' refuses to publish, `warn' publishes with a warning, and
+`allow' publishes without a warning."
+  :type '(choice (const :tag "Refuse to publish" error)
+                 (const :tag "Publish with a warning" warn)
+                 (const :tag "Publish anyway" allow))
+  :group 'org-export-conf)
+
+(defun org-conf--extract-markers (storage)
+  "Return the inline comment markers in STORAGE as (:ref :text) plists.
+Only markers still present in the body are returned: a dangling thread
+has lost its marker and cannot be represented here."
+  (let ((s (or storage ""))
+        (pos 0)
+        (markers nil))
+    (while (string-match
+            "<ac:inline-comment-marker[^>]*ac:ref=\"\\([^\"]+\\)\"[^>]*>"
+            s pos)
+      (let ((ref (match-string 1 s))
+            (text-start (match-end 0)))
+        (if (string-match "</ac:inline-comment-marker>" s text-start)
+            (progn
+              (push (list :ref ref
+                          :text (substring s text-start (match-beginning 0)))
+                    markers)
+              (setq pos (match-end 0)))
+          (setq pos text-start))))
+    (nreverse markers)))
+
+(defun org-conf--literal-occurrences (needle haystack)
+  "Count non-overlapping literal occurrences of NEEDLE in HAYSTACK."
+  (if (or (null needle) (string-empty-p needle))
+      0
+    (let ((pos 0)
+          (count 0))
+      (while (and (< pos (length haystack))
+                  (string-match (regexp-quote needle) haystack pos))
+        (setq count (1+ count)
+              pos (match-end 0)))
+      count)))
+
+(defun org-conf--reinject-markers (storage markers)
+  "Re-wrap MARKERS' texts in STORAGE, returning (NEW-STORAGE . REPORT).
+Each marker is a plist (:ref REF :text TEXT).  A marker is injected only
+when TEXT occurs exactly once; zero or several matches are reported as
+`ambiguous-zero' / `ambiguous-multiple' and left untouched.  A marker
+whose text spans inline markup that the export renders differently
+therefore becomes ambiguous rather than being silently dropped."
+  (let ((injections nil)
+        (report nil))
+    (dolist (marker markers)
+      (let* ((ref (plist-get marker :ref))
+             (text (plist-get marker :text))
+             (count (org-conf--literal-occurrences text storage)))
+        (cond
+         ((= count 1)
+          (let ((position (string-match (regexp-quote text) storage)))
+            (push (list position (+ position (length text)) ref) injections)
+            (push (list :ref ref :status 'injected) report)))
+         ((zerop count)
+          (push (list :ref ref :status 'ambiguous-zero) report))
+         (t
+          (push (list :ref ref :status 'ambiguous-multiple :count count)
+                report)))))
+    (let ((result storage))
+      (dolist (injection (sort injections
+                                (lambda (a b) (> (car a) (car b)))))
+        (let ((begin (nth 0 injection))
+              (end (nth 1 injection))
+              (ref (nth 2 injection)))
+          (setq result
+                (concat (substring result 0 begin)
+                        (format "<ac:inline-comment-marker ac:ref=\"%s\">" ref)
+                        (substring result begin end)
+                        "</ac:inline-comment-marker>"
+                        (substring result end)))))
+      (cons result (nreverse report)))))
+
+(defun org-conf--protect-markers (old-storage new-storage)
+  "Re-anchor OLD-STORAGE's inline markers in NEW-STORAGE.
+Return the storage to publish.  When any marker cannot be restored,
+`org-conf-marker-loss-policy' decides: `error' signals `user-error',
+`warn' messages and continues, `allow' continues silently."
+  (let ((markers (org-conf--extract-markers old-storage)))
+    (if (null markers)
+        new-storage
+      (let* ((reinjected (org-conf--reinject-markers new-storage markers))
+             (storage (car reinjected))
+             (report (cdr reinjected))
+             (failed (seq-remove (lambda (entry)
+                                   (eq (plist-get entry :status) 'injected))
+                                 report)))
+        (when failed
+          (let ((refs (mapconcat (lambda (entry) (plist-get entry :ref))
+                                 failed ", ")))
+            (pcase org-conf-marker-loss-policy
+              ('error
+               (user-error "Refusing to publish: %d inline comment anchor(s) cannot be restored (%s). Restore the anchor text, or set `org-conf-marker-loss-policy' to `warn' or `allow'"
+                           (length failed) refs))
+              ('warn
+               (message "Warning: %d inline comment anchor(s) cannot be restored (%s); publishing anyway."
+                        (length failed) refs))
+              (_
+               (message "Publishing with %d inline comment anchor(s) not restored (%s)."
+                        (length failed) refs)))))
+        storage))))
+
+(defun org-conf--protect-publish-output (conf-id output)
+  "Re-anchor CONF-ID's current inline markers in OUTPUT.
+When the live body cannot be read, fall back to the last adopted
+snapshot.  If that snapshot still has markers and the policy is
+`error', refuse to publish rather than risk orphaning them; with no
+snapshot or no markers there is no evidence of loss and publishing
+proceeds."
+  (let ((current (condition-case err
+                     (org-conf-cli-get-current-body conf-id)
+                   (error
+                    (message "Could not read page %s for marker protection: %s"
+                             conf-id (error-message-string err))
+                    nil))))
+    (cond
+     ((and current (plist-get current :ok))
+      (org-conf--protect-markers (plist-get current :storage) output))
+     (t
+      (let* ((conf-version (plist-get (org-conf--sync-watermarks) :conf-version))
+             (snapshot (and conf-version
+                            (org-conf--snapshot-read conf-id conf-version)))
+             (markers (org-conf--extract-markers snapshot)))
+        (cond
+         ((null markers)
+          (message "Marker protection skipped: no evidence of existing anchors for page %s."
+                   conf-id)
+          output)
+         ((eq org-conf-marker-loss-policy 'error)
+          (user-error "Refusing to publish: cannot read page %s to verify its %d inline comment anchor(s); the last snapshot (v%s) still has them. Retry, or set `org-conf-marker-loss-policy' to `warn' or `allow'"
+                      conf-id (length markers) conf-version))
+         ((eq org-conf-marker-loss-policy 'warn)
+          (message "Warning: cannot read page %s; its last snapshot (v%s) had %d anchor(s). Publishing anyway."
+                   conf-id conf-version (length markers))
+          output)
+         (t
+          (message "Cannot read page %s to verify its anchors; publishing as requested."
+                   conf-id)
+          output)))))))
+
+;;; ----------------------------------------------------------------------
+;;; M2: comments sidecar.
+;;; ----------------------------------------------------------------------
+
+(defcustom org-conf-comments-directory nil
+  "Where the comments sidecar is stored.
+nil means a `.conf-comments' directory next to the current org file."
+  :type '(choice (const :tag "Next to the org file" nil) directory)
+  :group 'org-export-conf)
+
+(defun org-conf--comments-file (page-id)
+  "Return the sidecar file for PAGE-ID."
+  (expand-file-name
+   (format "%s.org" page-id)
+   (or org-conf-comments-directory
+       (expand-file-name
+        ".conf-comments"
+        (or (and buffer-file-name
+                 (file-name-directory buffer-file-name))
+            default-directory)))))
+
+(defun org-conf--parse-comment (comment)
+  "Return COMMENT from `confluence comments' as a normalised plist."
+  (let ((inline (alist-get 'inlineProperties comment))
+        (author (alist-get 'author comment)))
+    (list :id (alist-get 'id comment)
+          :parent-id (alist-get 'parentId comment)
+          :title (alist-get 'title comment)
+          :location (alist-get 'location comment)
+          :resolution (alist-get 'resolution comment)
+          :body-storage (or (alist-get 'bodyStorage comment)
+                            (alist-get 'body comment)
+                            "")
+          :body-text (or (alist-get 'bodyText comment) "")
+          :author (alist-get 'displayName author)
+          :created (alist-get 'createdAt comment)
+          :marker-ref (alist-get 'markerRef inline)
+          :anchor-text (alist-get 'originalSelection inline))))
+
+(defun org-conf--aggregate-comments (comments)
+  "Return threads as (:root COMMENT :replies (COMMENT...)).
+Comments with a parent in the list are grouped under that parent; any
+other comment becomes a root, so nothing is silently dropped."
+  (let ((ids (mapcar (lambda (comment) (plist-get comment :id)) comments))
+        (roots nil)
+        (replies (make-hash-table :test 'equal)))
+    (dolist (comment comments)
+      (let ((parent (plist-get comment :parent-id)))
+        (if (and parent (member parent ids))
+            (push comment (gethash parent replies))
+          (push comment roots))))
+    (mapcar (lambda (root)
+              (list :root root
+                    :replies (nreverse
+                              (gethash (plist-get root :id) replies))))
+            (nreverse roots))))
+
+(defun org-conf--comment-thread-status (comment marker-refs markers-known)
+  "Return `dangling' or `open' for COMMENT.
+MARKERS-KNOWN nil means the body could not be read, so only the
+server's `resolution' field is trusted."
+  (let ((resolution (plist-get comment :resolution))
+        (ref (plist-get comment :marker-ref)))
+    (cond
+     ((equal resolution "dangling") 'dangling)
+     ((and markers-known
+           (equal (plist-get comment :location) "inline")
+           ref
+           (not (member ref marker-refs)))
+      'dangling)
+     (t 'open))))
+
+(defun org-conf--org-escape-body (text)
+  "Prefix lines that org would read as structure with a comma."
+  (replace-regexp-in-string "^\\(\\*\\|#\\+\\|:\\|,\\)" ",\\1" (or text "")))
+
+(defun org-conf--org-unescape-body (text)
+  "Remove the protective comma added by `org-conf--org-escape-body'."
+  (replace-regexp-in-string "^\\(,\\)\\(\\*\\|#\\+\\|:\\|,\\)" "\\2" (or text "")))
+
+(defun org-conf--org-escape-xml (text)
+  "Escape &, < and > in TEXT."
+  (let ((s (or text "")))
+    (setq s (replace-regexp-in-string "&" "&amp;" s))
+    (setq s (replace-regexp-in-string "<" "&lt;" s))
+    (setq s (replace-regexp-in-string ">" "&gt;" s))
+    s))
+
+(defun org-conf--org-text-to-storage (text)
+  "Convert plain TEXT into Confluence storage paragraphs."
+  (let ((paragraphs (split-string (or text "") "\n[ \t]*\n" t)))
+    (if (null paragraphs)
+        ""
+      (mapconcat (lambda (paragraph)
+                   (format "<p>%s</p>"
+                           (replace-regexp-in-string
+                            "\n" "<br/>"
+                            (org-conf--org-escape-xml
+                             (string-trim paragraph)))))
+                 paragraphs "\n"))))
+
+(defun org-conf--render-comment-node (comment status level)
+  "Insert COMMENT as an org heading of LEVEL with STATUS."
+  (let ((heading (or (plist-get comment :title)
+                     (format "comment %s" (plist-get comment :id))))
+        (tag (if (= level 1)
+                 (or (plist-get comment :location) "comment")
+               "reply")))
+    (insert (format "%s %s  :%s:\n" (make-string level ?*) heading tag))
+    (insert ":PROPERTIES:\n")
+    (dolist (pair (list (cons "CONF_COMMENT_ID" (or (plist-get comment :id) ""))
+                        (cons "CONF_PARENT_ID" (or (plist-get comment :parent-id) ""))
+                        (cons "CONF_MARKER_REF" (or (plist-get comment :marker-ref) ""))
+                        (cons "CONF_STATUS" (symbol-name status))
+                        (cons "CONF_ANCHOR_TEXT" (or (plist-get comment :anchor-text) ""))
+                        (cons "CONF_AUTHOR" (or (plist-get comment :author) ""))
+                        (cons "CONF_CREATED" (or (plist-get comment :created) ""))))
+      (insert (format ":%s: %s\n" (car pair) (cdr pair))))
+    (insert ":END:\n")
+    (insert (org-conf--org-escape-body (or (plist-get comment :body-text) "")))
+    (insert "\n")))
+
+(defun org-conf--comments-render
+    (page-id page-title comments marker-refs markers-known preserved)
+  "Return the sidecar org text.
+PRESERVED is an alist of (COMMENT-ID . STATUS) kept from the previous
+sidecar, so a local `answered' mark survives a pull."
+  (let ((threads (org-conf--aggregate-comments comments)))
+    (with-temp-buffer
+      (insert (format "#+TITLE: Confluence comments for %s\n" page-title)
+              (format "#+CONF_PAGE_ID: %s\n" page-id)
+              (format "#+CONF_SYNCED_AT: %s\n\n"
+                      (format-time-string "%Y-%m-%dT%H:%M:%S%z")))
+      (dolist (thread threads)
+        (let* ((root (plist-get thread :root))
+               (status (org-conf--comment-thread-status
+                        root marker-refs markers-known))
+               (preserved-status (cdr (assoc (plist-get root :id) preserved)))
+               (status (or (and (eq status 'open) preserved-status) status)))
+          (org-conf--render-comment-node root status 1)
+          (dolist (reply (plist-get thread :replies))
+            (org-conf--render-comment-node
+             reply
+             (or (cdr (assoc (plist-get reply :id) preserved)) 'open)
+             2))))
+      (buffer-string))))
+
+(defun org-conf--comments-preserved (file)
+  "Return (COMMENT-ID . answered) for every answered node in FILE."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (org-mode)
+      (let (preserved)
+        (org-map-entries
+         (lambda ()
+           (let ((id (org-entry-get nil "CONF_COMMENT_ID"))
+                 (status (org-entry-get nil "CONF_STATUS")))
+             (when (and (org-string-nw-p id) (equal status "answered"))
+               (push (cons id 'answered) preserved))))
+         nil nil)
+        preserved))))
+
+(defun org-conf--body-under-current-entry ()
+  "Return the body text under the current heading, without its drawer."
+  (save-excursion
+    (org-end-of-meta-data t)
+    (string-trim
+     (org-conf--org-unescape-body
+      (buffer-substring-no-properties (point) (org-end-of-subtree t t))))))
+
+(defun org-conf--comment-drafts-in-buffer ()
+  "Return reply drafts in the current sidecar buffer.
+A draft is a reply heading with a CONF_PARENT_ID but no
+CONF_COMMENT_ID yet.  Each draft is (:point :parent-id :body)."
+  (let (drafts)
+    (org-map-entries
+     (lambda ()
+       (let ((id (org-entry-get nil "CONF_COMMENT_ID"))
+             (parent (org-entry-get nil "CONF_PARENT_ID")))
+         (when (and (org-string-nw-p parent)
+                    (not (org-string-nw-p id)))
+           (push (list :point (point)
+                       :parent-id parent
+                       :body (org-conf--body-under-current-entry))
+                 drafts))))
+     nil nil)
+    (nreverse drafts)))
+
+(defun org-conf--comments-write
+    (page-id page-title comments marker-refs markers-known)
+  "Write the sidecar for PAGE-ID and return its path.
+`answered' marks from an existing sidecar are preserved."
+  (let* ((file (org-conf--comments-file page-id))
+         (preserved (org-conf--comments-preserved file))
+         (text (org-conf--comments-render page-id page-title comments
+                                          marker-refs markers-known preserved)))
+    (make-directory (file-name-directory file) t)
+    (let ((coding-system-for-write 'utf-8-unix))
+      (with-temp-file file
+        (insert text)))
+    file))
+
+(defun org-conf-comments-pull ()
+  "Fetch the page's comments and write the local sidecar."
+  (interactive)
+  (let* ((watermarks (org-conf--sync-watermarks))
+         (conf-id (plist-get watermarks :conf-id))
+         (title (car (plist-get (org-export--get-inbuffer-options
+                                 'org-conf-html)
+                                :title))))
+    (unless conf-id
+      (user-error "No #+CONF_ID in this buffer"))
+    (let ((res (org-conf--cli-json-safe
+                "comments" conf-id "--all" "--depth" "all")))
+      (unless (plist-get res :ok)
+        (user-error "Confluence comments failed: %s" (plist-get res :message)))
+      (let* ((comments (mapcar #'org-conf--parse-comment
+                               (alist-get 'comments (plist-get res :data))))
+             (page (condition-case nil
+                       (org-conf-cli-get-current-body conf-id)
+                     (error nil)))
+             (markers-known (and page (plist-get page :ok)))
+             (refs (when markers-known
+                     (mapcar (lambda (marker) (plist-get marker :ref))
+                             (org-conf--extract-markers
+                              (plist-get page :storage)))))
+             (file (org-conf--comments-write
+                    conf-id (or title (format "page %s" conf-id))
+                    comments refs markers-known)))
+        (message "Wrote %d comment(s) to %s" (length comments) file)
+        file))))
+
+(defun org-conf--post-comment-reply (page-id draft)
+  "Post DRAFT as a reply on PAGE-ID and record the returned comment id.
+DRAFT is (:point :parent-id :body).  The reply is posted to
+`--parent' only; no inline metadata is sent, which Server 8.x rejects."
+  (let* ((storage (org-conf--org-text-to-storage (plist-get draft :body)))
+         (file (org-conf--write-utf8-file storage))
+         (res (unwind-protect
+                  (org-conf--cli-json-safe
+                   "comment" page-id
+                   "--parent" (plist-get draft :parent-id)
+                   "-f" file "--format" "storage")
+                (ignore-errors (delete-file file)))))
+    (unless (plist-get res :ok)
+      (user-error "Comment reply failed: %s" (plist-get res :message)))
+    (let ((id (alist-get 'id (plist-get res :data))))
+      (unless id
+        (user-error "Comment reply returned no id"))
+      (goto-char (plist-get draft :point))
+      (org-entry-put nil "CONF_COMMENT_ID" id)
+      (org-entry-put nil "CONF_PARENT_ID" (plist-get draft :parent-id))
+      (org-entry-put nil "CONF_STATUS" "answered")
+      id)))
+
+(defun org-conf-comments-push (&optional dry-run)
+  "Post every reply draft in the sidecar that has no CONF_COMMENT_ID.
+With a prefix argument, list what would be posted and do nothing.
+The server has no resolve endpoint for Server 8.x, so this only marks
+the local reply as `answered'; it never claims a remote resolution."
+  (interactive "P")
+  (let* ((watermarks (org-conf--sync-watermarks))
+         (conf-id (plist-get watermarks :conf-id)))
+    (unless conf-id
+      (user-error "No #+CONF_ID in this buffer"))
+    (let ((file (org-conf--comments-file conf-id)))
+      (unless (file-readable-p file)
+        (user-error "No comments sidecar at %s; run `f m' first" file))
+      (with-current-buffer (find-file-noselect file)
+        (org-mode)
+        (let ((drafts (org-conf--comment-drafts-in-buffer)))
+          (cond
+           ((null drafts)
+            (message "No reply drafts to post"))
+           (dry-run
+            (dolist (draft drafts)
+              (message "Would reply to %s: %s"
+                       (plist-get draft :parent-id)
+                       (truncate-string-to-width
+                        (or (plist-get draft :body) "") 60)))
+            (message "Dry run: %d reply/replies not posted" (length drafts)))
+           ((y-or-n-p (format "Post %d reply/replies to page %s? "
+                              (length drafts) conf-id))
+            (dolist (draft drafts)
+              (org-conf--post-comment-reply conf-id draft))
+            (save-buffer)
+            (message "Posted %d reply/replies" (length drafts)))
+           (t
+            (message "Nothing posted"))))))))
+
+;;; ======================================================================
+;;;                          Export Functions
 ;;; ======================================================================
 (defun org-conf-export-page-info
     (&optional async subtreep visible-only body-only ext-plist)
@@ -2451,9 +3709,13 @@ first."
             (setq output (org-export-as
                           'org-conf-html subtreep visible-only body-only org-conf-plist))
             (org-conf--log "✅ export: %d chars" (length output))
+            ;; Keep inline comment anchors before touching the page.
+            (setq output (org-conf--protect-publish-output conf-id output))
             ;; Update the page!
             (setq ver-msg (read-string "Version message: "))
-            (org-conf-backend-update-page conf-id title conf-space output version ver-msg)))
+            (when (org-conf-backend-update-page
+                   conf-id title conf-space output version ver-msg)
+              (org-conf--maybe-adopt-after-publish))))
       (let ((org-conf--upload-attachments upload-attachments))
         (org-conf-create-page-and-export)))))
 
@@ -2531,6 +3793,10 @@ This only affects the REST backend; the CLI manages its own credentials."
     (:conf-id "CONF_ID" nil nil t)
     (:conf-page "CONF_PAGE" nil nil t)
     (:conf-space "CONF_SPACE" nil org-conf-default-space t)
+    (:conf-version "CONF_VERSION" nil nil t)
+    (:conf-remote-hash "CONF_REMOTE_HASH" nil nil t)
+    (:conf-local-hash "CONF_LOCAL_HASH" nil nil t)
+    (:conf-synced-at "CONF_SYNCED_AT" nil nil t)
     )
   :menu-entry
   '(?f "Export to Confluence"
@@ -2539,6 +3805,11 @@ This only affects the REST backend; the CLI manages its own credentials."
       (?i "Image info" org-conf-export-img-info)
       (?f "To Confluence (creates page if new)" org-conf-export-to-conf)
       (?w "To Confluence (no attachment upload)" org-conf-export-to-conf-without-post)
+      (?s "Sync: compare with Confluence (ediff)" org-conf-sync)
+      (?a "Sync: adopt remote version as baseline" org-conf-sync-adopt)
+      (?h "History: ediff a version" org-conf-history)
+      (?m "Comments: pull to sidecar" org-conf-comments-pull)
+      (?M "Comments: push reply drafts" org-conf-comments-push)
       (?r "Forget the wrong password" org-conf-forget-password)
       (?o "Open page" org-conf-open-page)
       (?l "Show debug log" org-conf-show-log)

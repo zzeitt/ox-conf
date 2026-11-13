@@ -116,6 +116,105 @@ same-path pages) get an `[id]` suffix from `org-conf--unique-labels`, otherwise
 `org-conf-parent-child-page-limit`, `org-conf-parent-root-label`,
 `org-conf-manual-parent-label`.
 
+### Bidirectional sync (M1/M3, 2026-11-12)
+
+`f s` (`org-conf-sync`) compares the buffer with the live page and `f a`
+(`org-conf-sync-adopt`) records the remote version as the baseline. `f h`
+(`org-conf-history`) lists the page's versions and opens a three-way ediff of the
+chosen version, the local export, and the current remote. These commands are
+**CLI-only** and call `org-conf-cli-get-current-body` / `-get-version-body` /
+`-list-versions` directly; there is no REST implementation, by design (the
+orchestrator asked for a single transport). `org-conf--cli-json-safe` is the
+non-signalling CLI runner: it returns `(:ok t :data …)` or
+`(:ok nil :status 404 :code "NOT_FOUND" :message …)`, so a 404 can mean
+`remote-deleted` while other failures still raise.
+
+Historical bodies come from
+`content/{id}?status=historical&version=N&expand=body.storage,version`; the
+`/content/{id}/version/N` and `/diff` endpoints both 404 on Server 8.x.
+`org-conf--snapshot-ensure` reuses an existing `.conf-history` snapshot before
+fetching, so a version already written by `f a` is never stored twice.
+
+Watermarks live in the org header: `#+CONF_VERSION`, `#+CONF_REMOTE_HASH`,
+`#+CONF_LOCAL_HASH`, `#+CONF_SYNCED_AT`. `org-conf--sync-state` is a table-driven
+six-state machine (`synced`, `remote-ahead`, `local-ahead`, `diverged`,
+`remote-deleted`, `local-missing`).
+
+**Crucial hash rule:** hashes are compared like-for-like only. Confluence rewrites
+storage on save — it injects `ac:macro-id` / `ac:schema-version` and reorders macro
+parameters — so a local export is *never* hashed against a fetched body. The remote
+hash is compared with the previous remote hash, and the normalized org hash with the
+previous normalized org hash. A new remote version whose body hash did not change
+(an empty save) therefore lands in `synced`, with only `CONF_VERSION` due for a bump.
+`org-conf--normalize-org-text` strips BOM, normalizes CRLF, strips trailing blanks,
+and removes `#+CONF_*` lines so that rewriting watermarks never dirties the hash.
+
+`f s` opens `ediff-files` (or `ediff-files3` with the `CONF_VERSION` snapshot) on
+canonical one-token-per-line projections from `org-conf--canonicalize-storage`. The
+projection sorts attributes, drops the server-injected attributes listed in
+`org-conf-canonical-dropped-attributes`, sorts `<ac:parameter>` children by
+`ac:name`, and drops empty parameters (Confluence drops them on save). It is
+display-only and never converted back to org. On an in-sync page the canonical
+local-vs-remote diff is empty. Snapshots are written to
+`org-conf-history-directory` or `.conf-history/<pageId>/v<N>.storage.xhtml`, with
+`org-conf-history-retain` (default 20) pruning the oldest.
+
+After a successful PUT, `org-conf--export-to-conf` calls
+`org-conf--maybe-adopt-after-publish` (unless
+`org-conf-sync-adopt-after-publish` is nil): it fetches the page once more and
+records that as the baseline, because the body we sent is not the body to hash.
+A failed refresh only warns; it never turns a successful publish into an error.
+
+### Inline comment anchors (M4, 2026-11-12)
+
+Before the PUT, `org-conf--protect-publish-output` fetches the page's current
+storage, `org-conf--extract-markers` collects every
+`<ac:inline-comment-marker ac:ref="…">text</ac:inline-comment-marker>` still
+present, and `org-conf--reinject-markers` re-wraps the same `ac:ref` around the
+same text in the freshly exported body. A marker whose text occurs zero or
+several times is `ambiguous-zero` / `ambiguous-multiple` and is **not** silently
+dropped; `org-conf--protect-markers` then applies
+`org-conf-marker-loss-policy`: `error` (default) raises `user-error` before the
+PUT, `warn` messages, `allow` continues silently. Dangling threads have no
+marker and are therefore not represented. Marker text spanning inline markup
+(`<strong>…</strong>`) that the exporter renders differently cannot be matched
+and is reported as ambiguous. The fetch is CLI-only. When it fails, the last
+adopted snapshot is consulted: if that snapshot still has markers and the policy
+is `error`, publishing is **refused** (fail closed); with no snapshot or no
+markers there is no evidence of loss, so a warning is issued and publishing
+proceeds.
+
+### Comment threads (M2, 2026-11-12)
+
+`f m` (`org-conf-comments-pull`) runs `confluence comments <id> --all --depth all`
+(never `--location inline`, which would drop footer replies), parses each comment
+into a plist, groups replies by `parentId`, and writes a sidecar at
+`org-conf-comments-directory` or `.conf-comments/<pageId>.org`. Each thread is a
+heading with `CONF_COMMENT_ID`, `CONF_PARENT_ID`, `CONF_MARKER_REF`,
+`CONF_STATUS`, `CONF_ANCHOR_TEXT`, `CONF_AUTHOR`, `CONF_CREATED`. A thread is
+`dangling` when the server says so, or when its inline `markerRef` is missing
+from the current body (skipped when the body could not be read). A locally
+`answered` mark is preserved across pulls.
+
+`f M` (`org-conf-comments-push`) finds reply headings that have a
+`CONF_PARENT_ID` but no `CONF_COMMENT_ID`, converts the body to storage
+(`<p>`-wrapped, XML-escaped), and posts with
+`confluence comment <id> --parent <parentId> -f <file> --format storage` — never
+with `--inline-*`, which Server 8.x rejects. The returned id is written back and
+the local status becomes `answered`; Server has no resolve endpoint, so nothing
+claims a remote resolution. A prefix argument is a dry run. Comment bodies are
+comma-escaped when rendered so a line starting with `*` or `#+` cannot break the
+sidecar.
+
+Known limitations of this area:
+
+- Running `confluence comment-delete` on an inline root comment leaves an orphan
+  `<ac:inline-comment-marker>` in the page body: `commentCount` is 0 but the
+  marker remains. Removing it needs one body update, which ox-conf does not
+  automate.
+- `f M` must be run from the source org buffer. The sidecar has no `#+CONF_ID`,
+  so running it there fails explicitly.
+
 ## Tests
 
 ```sh
@@ -123,7 +222,7 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (138 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (258 tests) in `test/ox-conf-test.el`. The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement,
 old-page comment retention, the drill-down decision table, backend selection and
@@ -131,9 +230,25 @@ the REST adapters, the CLI command lines and error handling, parent-scope
 inference (common ancestor, sibling/recent/title-search fallbacks),
 recent-parent filtering, the file-like menu (`..`, confirm, recent, children,
 manual), the background log (markers, command strings, elisp forms, body
-retention, read-only special-mode and highlighting), and the `f f`/`f w` upload
+retention, read-only special-mode and highlighting), the `f f`/`f w` upload
 confirmation (accept, decline-to-create, confirmation after creation, declining
-the new page without creating another, and the attachment flag).
+the new page without creating another, and the attachment flag), and M1 sync
+(hash normalization for BOM/CRLF/trailing blanks/`#+CONF_*`, the six-state
+machine plus the empty-save case, watermark read/write, deterministic storage
+projection, CLI result parsing, snapshot round-trip/retention, baseline adoption,
+and `org-conf--sync-collect` against stubbed remote bodies), M1 review fixes
+(narrowing-safe local hash, self-closing parameters), M3 (version-choice
+ordering, snapshot reuse vs fetch, three-way ediff file wiring), M4 (marker
+extraction, 0/1/multiple matches, formatted-text ambiguity, the three loss
+policies, the PUT-time protection hook, and fail-closed behavior when the live
+body is unreadable) and M2 (comment parsing, parentId aggregation, dangling
+status, sidecar rendering with preserved `answered`, org body escaping, storage
+conversion, draft detection and reply write-back), and the export layer
+(src-block language mapping including asm/rs and the three Jira macro paths,
+special blocks and their defaults, headline numbering, TOC, tag colours, LaTeX
+and export-block filters, external/file/image links, targets and center blocks).
+`ox-conf-test--export' drives the real exporter on a temp org buffer, so element
+parsing and transcoding are exercised together.
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
 `org-conf--read-parent-id` are covered with `cl-letf` stubs at the prompt and
 backend boundaries; the drill-down stubs also assert which menus were shown.
@@ -168,6 +283,12 @@ The entire backend lives in a single file. Its structure:
 - `org-conf-recent-parent-limit` — how many frequently used parents to offer first
 - `org-conf-parent-root-label` — the display string for the "no parent page" choice
 - `org-conf-manual-parent-label` — the display string for the "type a URL/ID" escape hatch
+- `org-conf-history-directory` — snapshot base directory (`nil` = `.conf-history` next to the org file)
+- `org-conf-history-retain` — snapshots kept per page (default 20)
+- `org-conf-sync-adopt-after-publish` — refresh the sync baseline after a successful PUT (default `t`)
+- `org-conf-canonical-dropped-attributes` — attributes removed from the ediff projection (default `ac:macro-id`, `ac:schema-version`)
+- `org-conf-marker-loss-policy` — `error` (default) / `warn` / `allow` when publishing would drop inline anchors
+- `org-conf-comments-directory` — comments sidecar base directory (`nil` = `.conf-comments` next to the org file)
 
 ### 2. Template layer
 `org-conf-template` (outer wrapper), `org-conf-inner-template` (prepends TOC, appends footnotes), `org-conf-headline` (wraps in `numberedheadings` macro when `#+OPTIONS: num:t`), `org-conf-toc` (generates `ac:toc` macro), and `org-conf--tags` (maps Chinese tags to Confluence status macros colored Green/Yellow/Red/Blue).
