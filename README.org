@@ -153,7 +153,69 @@ Options:
            org-conf-export-to-conf-without-post
   - ~f r~: "Forget the wrong password" (REST auth cache only)
            org-conf-forget-password
+  - ~f s~: "Sync: compare with Confluence (ediff)" org-conf-sync
+  - ~f a~: "Sync: adopt remote version as baseline" org-conf-sync-adopt
+  - ~f h~: "History: ediff a version" org-conf-history
+  - ~f m~: "Comments: pull to sidecar" org-conf-comments-pull
+  - ~f M~: "Comments: push reply drafts" org-conf-comments-push
   - ~f l~: "Show debug log" org-conf-show-log
+
+Sync (M1):
+  - ~f s~ compares the buffer with the live page without writing to
+    Confluence.  It reports one of synced / remote-ahead / local-ahead
+    / diverged / remote-deleted / local-missing, and opens an ediff of
+    canonical storage projections when the sides differ.
+  - ~f a~ records the current remote version as the baseline.  It
+    writes #+CONF_VERSION, #+CONF_REMOTE_HASH, #+CONF_LOCAL_HASH and
+    #+CONF_SYNCED_AT, saves a local snapshot under .conf-history/,
+    and never writes to the page.
+  - Hashes are compared like-for-like only.  Confluence rewrites
+    storage on save (it injects ac:macro-id and reorders macro
+    parameters), so a local export is never hashed against a fetched
+    body; the remote hash is only compared with the previous remote
+    hash, and the local org hash with the previous local one.
+
+History (M3):
+  - ~f h~ lists the page's versions and opens a three-way ediff:
+    the chosen version, the storage the local org exports, and the
+    current remote version.  Historical bodies come from
+    content/{id}?status=historical&version=N (the /version/N endpoint
+    404s on Server 8.x).  Versions already in .conf-history/ are
+    reused instead of being stored twice.
+
+Markers (M4):
+  - Before a PUT, the page's existing
+    <ac:inline-comment-marker ac:ref="..."> anchors are re-wrapped
+    around the same text in the new export, so inline threads stay
+    anchored.
+  - A marker whose text matches zero or several times is ambiguous.
+    ~org-conf-marker-loss-policy~ decides: error (default) refuses to
+    publish, warn publishes with a warning, allow publishes silently.
+  - Markers whose text spans inline markup that the export renders
+    differently cannot be re-anchored; they are reported as ambiguous
+    rather than skipped silently.
+  - If the live body cannot be read, the last adopted snapshot is
+    consulted: when it still has markers and the policy is error,
+    publishing is refused instead of proceeding blind.
+
+Comments (M2):
+  - ~f m~ pulls every comment thread into
+    .conf-comments/<pageId>.org, one heading per thread with
+    CONF_COMMENT_ID / CONF_PARENT_ID / CONF_MARKER_REF / CONF_STATUS /
+    CONF_ANCHOR_TEXT / CONF_AUTHOR / CONF_CREATED properties.  Replies
+    are grouped by parentId; a thread whose marker is gone is marked
+    dangling and only warned about.
+  - Add a ** child under a thread and run ~f M~ to post it as a
+    reply (--parent only; Server 8.x rejects inline metadata).  The
+    returned comment id is written back and the local status becomes
+    answered.  Server has no resolve endpoint, so nothing claims a
+    remote resolution.
+  - Known limits: deleting an inline root comment with
+    =comment-delete= leaves an orphan <ac:inline-comment-marker> in
+    the body (commentCount is 0 but the marker remains); removing it
+    needs one body update, which ox-conf does not automate.
+    ~f M~ must run from the source org buffer: the sidecar has no
+    #+CONF_ID, so running it there errors explicitly.
 
 Response:
   - Once exported successfully, yout will get ~PUT SUCCEED~ response.
@@ -233,6 +295,36 @@ Change Log:
                 the old CONF block as a comment (one active ID).  A newly
                 created page is confirmed before upload too; declining
                 leaves that empty page and stops.
+  - 2026-11-12: Sync M1: =f s= detects remote/local drift with
+                #+CONF_VERSION/REMOTE_HASH/LOCAL_HASH watermarks and
+                opens a canonical ediff; =f a= adopts the current remote
+                version as the baseline.  Snapshots live under
+                .conf-history/<pageId>/ with a 20-version retention.
+                A successful publish refreshes the baseline
+                automatically, and the ediff projection drops
+                server-injected macro attributes so an in-sync page
+                shows no spurious diff.
+  - 2026-11-12: Sync M3: =f h= picks a historical version and opens a
+                three-way ediff (version / local export / current
+                remote).  Historical bodies are fetched through
+                status=historical and cached in .conf-history/ so a
+                version already snapshotted is never fetched twice.
+  - 2026-11-12: Sync M4: inline comment markers are re-injected before
+                a PUT, so publishing no longer orphans inline threads.
+                ~org-conf-marker-loss-policy~ aborts by default when an
+                anchor cannot be restored; warn/allow downgrade it.
+  - 2026-11-12: Sync M2: =f m= pulls comment threads into a sidecar org
+                file; =f M= posts reply drafts with --parent and writes
+                the returned comment id back.  Marker protection now
+                fails closed when the live body cannot be read but the
+                last snapshot still has anchors.
+  - 2026-11-13: Added ERT coverage for the export-layer transcoders
+                (src-block language mapping and Jira macros, special
+                blocks, headline numbering, TOC, tags, LaTeX and
+                export-block filters, links, targets, center blocks).
+                Fixed the 修改 tag colour ("Yello" -> "Yellow") and
+                external links losing their scheme (https://x became
+                //x).
 
 * Example
 Given this file: =tmp.org=.
