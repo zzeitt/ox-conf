@@ -1473,7 +1473,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-export-to-conf-prompts-before-updating ()
   (let ((prompt nil)
         (updated nil)
-        (export-plist nil))
+        (export-plist nil)
+        (org-conf-batch-assume-yes nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1496,7 +1497,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 
 (ert-deftest ox-conf-test-export-to-conf-creates-when-declined ()
   (let ((created nil)
-        (updated nil))
+        (updated nil)
+        (org-conf-batch-assume-yes nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1514,7 +1516,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-create-flow-asks-before-uploading ()
   (let ((prompt nil)
         (updated nil)
-        (org-conf--just-created t))
+        (org-conf--just-created t)
+        (org-conf-batch-assume-yes nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1534,7 +1537,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-declining-the-new-page-does-not-create-another ()
   (let ((created nil)
         (updated nil)
-        (org-conf--just-created t))
+        (org-conf--just-created t)
+        (org-conf-batch-assume-yes nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1594,7 +1598,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 (ert-deftest ox-conf-test-export-without-post-prompts-and-skips-attachments ()
   (let ((prompt nil)
         (updated nil)
-        (export-plist nil))
+        (export-plist nil)
+        (org-conf-batch-assume-yes nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -1616,7 +1621,8 @@ list of menus that were shown, in order.  The getter is repeatable."
 
 (ert-deftest ox-conf-test-export-without-post-creates-when-declined ()
   (let ((called nil)
-        (upload 'unset))
+        (upload 'unset)
+        (org-conf-batch-assume-yes nil))
     (with-temp-buffer
       (org-mode)
       (insert "#+TITLE: My Doc\n#+CONF_ID: 7\n#+CONF_SPACE: DOCS\n\nBody\n")
@@ -2969,5 +2975,133 @@ disabled so the test never touches Confluence."
 
 (ert-deftest ox-conf-test-template-is-a-passthrough ()
   (should (equal "<p>x</p>" (org-conf-template "<p>x</p>" nil))))
+
+;;; ----------------------------------------------------------------------
+;;; Batch / non-interactive fixes.
+;;; ----------------------------------------------------------------------
+
+(ert-deftest ox-conf-test-rest-put-is-synchronous ()
+  "A PUT must block until the response arrives, or batch Emacs exits early."
+  (let ((captured nil)
+        (org-conf-rest-timeout 42))
+    (cl-letf (((symbol-function 'request)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (make-request-response :data 'fake))))
+      (should (eq 'fake (org-conf-rest-put "1" "T" "SSC" "<p>x</p>" 2 "msg"))))
+    (should (eq t (plist-get (cdr captured) :sync)))
+    (should (equal 42 (plist-get (cdr captured) :timeout)))
+    (should (equal "PUT" (plist-get (cdr captured) :type)))))
+
+(ert-deftest ox-conf-test-rest-post-file-is-synchronous ()
+  "Attachment POSTs must also block in batch."
+  (let ((captured nil)
+        (org-conf-rest-timeout 42))
+    (cl-letf (((symbol-function 'request)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (make-request-response :data 'fake))))
+      (org-conf-rest-post-file "1" "img.png"))
+    (should (eq t (plist-get (cdr captured) :sync)))
+    (should (equal 42 (plist-get (cdr captured) :timeout)))))
+
+(ert-deftest ox-conf-test-version-message-uses-the-default-in-batch ()
+  (let ((noninteractive t)
+        (org-conf-default-version-message "batch msg"))
+    (should (equal "batch msg" (org-conf--version-message)))))
+
+(ert-deftest ox-conf-test-version-message-is-empty-in-batch-when-unset ()
+  "Batch must never call `read-string', even with no configured message."
+  (let ((noninteractive t)
+        (org-conf-default-version-message nil))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (error "must not prompt in batch"))))
+      (should (equal "" (org-conf--version-message))))))
+
+(ert-deftest ox-conf-test-version-message-ignores-the-default-when-interactive ()
+  (let ((noninteractive nil)
+        (org-conf-default-version-message "batch msg"))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (prompt &rest _) (concat "asked:" prompt))))
+      (should (equal "asked:Version message: "
+                     (org-conf--version-message))))))
+
+(ert-deftest ox-conf-test-display-latex-fragment-becomes-mathblock ()
+  (let* ((org-conf-latex-display-as-mathblock t)
+         (output (ox-conf-test--export "\\[x^2\\]" "num:nil toc:nil")))
+    (should (string-match-p "ac:name=\"mathblock\"" output))
+    (should-not (string-match-p "ac:name=\"mathinline\"" output))
+    (should (string-match-p "x\\^2" output))
+    (should-not (string-match-p (regexp-quote "\\[x^2\\]") output))))
+
+(ert-deftest ox-conf-test-display-latex-fragment-can-stay-inline ()
+  (let* ((org-conf-latex-display-as-mathblock nil)
+         (output (ox-conf-test--export "\\[x^2\\]" "num:nil toc:nil")))
+    (should (string-match-p "ac:name=\"mathinline\"" output))
+    (should-not (string-match-p "ac:name=\"mathblock\"" output))))
+
+(ert-deftest ox-conf-test-inline-latex-fragment-is-unaffected ()
+  (let* ((org-conf-latex-display-as-mathblock t)
+         (output (ox-conf-test--export "inline $x^2$ here" "num:nil toc:nil")))
+    (should (string-match-p "ac:name=\"mathinline\"" output))
+    (should-not (string-match-p "ac:name=\"mathblock\"" output))))
+
+(ert-deftest ox-conf-test-confirm-assumes-yes-in-batch ()
+  (let ((noninteractive t)
+        (org-conf-batch-assume-yes t))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (error "must not prompt in batch"))))
+      (should (org-conf--confirm "ok? ")))))
+
+(ert-deftest ox-conf-test-confirm-can-be-forced-in-batch ()
+  (let ((noninteractive t)
+        (org-conf-batch-assume-yes nil))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+      (should-not (org-conf--confirm "ok? ")))))
+
+(ert-deftest ox-conf-test-confirm-prompts-when-interactive ()
+  (let ((noninteractive nil)
+        (org-conf-batch-assume-yes t))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) 'asked)))
+      (should (eq 'asked (org-conf--confirm "ok? "))))))
+
+(ert-deftest ox-conf-test-json-parse-string-falls-back-to-json-read ()
+  "Emacs 29.2 without native JSON has neither native parser."
+  (cl-letf (((symbol-function 'json-parse-string) nil)
+            ((symbol-function 'json-parse-buffer) nil))
+    (should (equal '((a . 1) (b . "x"))
+                   (org-conf--json-parse-string
+                    "{\"a\":1,\"b\":\"x\"}")))))
+
+(ert-deftest ox-conf-test-cli-parse-result-works-without-native-json ()
+  "Emacs 29.2 can lack both json-parse-string and json-parse-buffer."
+  (cl-letf (((symbol-function 'json-parse-buffer) nil)
+            ((symbol-function 'json-parse-string) nil))
+    (should (equal '(:ok t :data ((a . 1)))
+                   (org-conf--cli-parse-result 0 "{\"a\":1}" "")))))
+
+(ert-deftest ox-conf-test-cli-json-works-without-native-json ()
+  "The transport must also work on Emacs 29.2."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_program) "/usr/bin/confluence"))
+            ((symbol-function 'json-parse-string) nil)
+            ((symbol-function 'json-parse-buffer) nil)
+            ((symbol-function 'call-process)
+             (lambda (_program _infile dest _display &rest _)
+               (with-current-buffer (if (consp dest) (car dest) dest)
+                 (insert "{\"id\":\"7\"}"))
+               0)))
+    (should (equal '((id . "7")) (org-conf--cli-json "info" "7")))))
+
+(ert-deftest ox-conf-test-cli-error-message-works-without-native-json ()
+  (let ((file (make-temp-file "ox-conf-err" nil ".json")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"error\":\"boom\",\"code\":\"API_ERROR\"}"))
+          (cl-letf (((symbol-function 'json-parse-string) nil)
+                    ((symbol-function 'json-parse-buffer) nil))
+            (should (equal "boom" (org-conf--cli-error-message file)))))
+      (delete-file file))))
 
 ;;; ox-conf-test.el ends here
