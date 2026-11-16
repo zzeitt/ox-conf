@@ -325,6 +325,22 @@ Change Log:
                 Fixed the 修改 tag colour ("Yello" -> "Yellow") and
                 external links losing their scheme (https://x became
                 //x).
+  - 2026-11-16: Batch fixes: REST PUT and attachment POST now pass
+                :sync t, so =emacs --batch= no longer exits before the
+                request completes; ~org-conf-rest-timeout~ (default 60s)
+                replaces the hard-coded 2s/10s timeouts.
+                ~org-conf-default-version-message~ supplies the version
+                message when noninteractive.  Display LaTeX fragments
+                (\\[ ... \\]) are promoted to mathblocks by
+                ~org-conf-latex-display-as-mathblock~ (default t).
+  - 2026-11-16: Batch follow-up: noninteractive exports never prompt.
+                ~org-conf-default-version-message~ nil now means an
+                empty message instead of a =read-string= call, and
+                ~org-conf-batch-assume-yes~ (default t) auto-confirms
+                upload, attachment-replace and comment-push prompts.
+                The CLI JSON parser prefers =json-parse-string= and
+                falls back to pure-Elisp =json-read=, so Emacs 29
+                builds without native JSON work too.
 
 * Example
 Given this file: =tmp.org=.

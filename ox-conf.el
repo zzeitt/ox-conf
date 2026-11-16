@@ -4,7 +4,7 @@
 
 ;; Author: zeit <zzzeittt at gmail dot com>
 ;; Keywords: convenience
-;; Version: 1.3.0
+;; Version: 1.3.1
 ;; Package-Requires: ((emacs "27.1") (request "0.3.3"))
 
 ;; This file is NOT part of GNU Emacs.
@@ -250,6 +250,22 @@
 ;;                 Fixed the 修改 tag colour ("Yello" -> "Yellow") and
 ;;                 external links losing their scheme (https://x became
 ;;                 //x).
+;;   - 2026-11-16: Batch fixes: REST PUT and attachment POST now pass
+;;                 :sync t, so `emacs --batch' no longer exits before the
+;;                 request completes; `org-conf-rest-timeout' (default
+;;                 60s) replaces the hard-coded 2s/10s timeouts.
+;;                 `org-conf-default-version-message' supplies the
+;;                 version message when noninteractive.  Display LaTeX
+;;                 fragments (\\[ ... \\]) are promoted to mathblocks by
+;;                 `org-conf-latex-display-as-mathblock' (default t).
+;;   - 2026-11-16: Batch follow-up: noninteractive exports never prompt.
+;;                 `org-conf-default-version-message' nil now means an
+;;                 empty message instead of a `read-string' call, and
+;;                 `org-conf-batch-assume-yes' (default t) auto-confirms
+;;                 upload, attachment-replace and comment-push prompts.
+;;                 The CLI JSON parser prefers `json-parse-string' and
+;;                 falls back to pure-Elisp `json-read', so Emacs 29
+;;                 builds without native JSON work too.
 
 
 ;;; Code:
@@ -257,6 +273,7 @@
 (require 'ox)
 (require 'request)
 (require 'url-util)
+(require 'json)
 
 ;;; ======================================================================
 (defcustom org-conf-url
@@ -340,6 +357,21 @@ on `exec-path', and falls back to the REST API otherwise."
   "Maximum number of lines kept in `org-conf-log-buffer-name'."
   :type 'integer
   :group 'org-export-conf)
+
+(defcustom org-conf-batch-assume-yes t
+  "Whether noninteractive exports answer \"yes\" at confirmation prompts.
+Batch Emacs cannot answer `y-or-n-p'; with this non-nil (the default) an
+explicit batch export proceeds as if the user confirmed.  Set it to nil
+to keep the prompt and let the batch job fail on EOF."
+  :type 'boolean
+  :group 'org-export-conf)
+
+(defun org-conf--confirm (prompt)
+  "Ask PROMPT, auto-answering yes in batch when allowed.
+See `org-conf-batch-assume-yes'."
+  (if (and noninteractive org-conf-batch-assume-yes)
+      t
+    (y-or-n-p prompt)))
 
 (defconst org-conf--log-level-def
   '(;; debugging
@@ -613,21 +645,16 @@ holding export options."
       (format "%s\n"
               (or contents "")))))
 
-(defun org-conf-latex-fragment-filter (data backend info)
-  "function applied to a transcoded latex-fragment.
-  each filter is called with three arguments: the transcoded data,
-  as a string, the back-end, as a symbol, and the communication
-  channel, as a plist.  it must return a string or nil."
-  (format
-"\n<ac:structured-macro ac:name=\"mathinline\">
-  <ac:parameter ac:name=\"body\">%s</ac:parameter>
-</ac:structured-macro>\n"
-  ;; Remove guiding '\(' and trailing '\)'.
-  (replace-regexp-in-string "\\\\(\\|\\\\)" "" (org-html-encode-plain-text data))
-))
+(defcustom org-conf-latex-display-as-mathblock t
+  "Whether \\[ … \\] fragments are exported as mathblocks.
+Org parses \\[ … \\] as a latex-fragment rather than a
+latex-environment.  When this is non-nil, such a fragment is promoted to
+the block form so display layout (fractions, sums, ...) survives."
+  :type 'boolean
+  :group 'org-export-conf)
 
-(defun org-conf-latex-environment-filter (data backend info)
-  "Function applied to a transcoded latex-environment."
+(defun org-conf--mathblock (content)
+  "Wrap CONTENT in a centred Confluence mathblock macro."
   (format
 "\n<ac:structured-macro ac:name=\"mathblock\">
   <ac:parameter ac:name=\"alignment\">center</ac:parameter>
@@ -637,7 +664,44 @@ holding export options."
     ]]>
   </ac:plain-text-body>
 </ac:structured-macro>\n"
-  data))
+   content))
+
+(defun org-conf--latex-display-fragment-p (data)
+  "Non-nil when DATA is a display fragment delimited by \\[ ... \\]."
+  (let ((text (string-trim (or data ""))))
+    (and (string-prefix-p "\\[" text)
+         (string-suffix-p "\\]" text))))
+
+(defun org-conf--strip-latex-display-delimiters (data)
+  "Remove the leading \\[ and trailing \\] from DATA."
+  (let ((text (string-trim (or data ""))))
+    (if (and (>= (length text) 4)
+             (string-prefix-p "\\[" text)
+             (string-suffix-p "\\]" text))
+        (string-trim (substring text 2 (- (length text) 2)))
+      text)))
+
+(defun org-conf-latex-fragment-filter (data backend info)
+  "function applied to a transcoded latex-fragment.
+  each filter is called with three arguments: the transcoded data,
+  as a string, the back-end, as a symbol, and the communication
+  channel, as a plist.  it must return a string or nil."
+  (cond
+   ((and org-conf-latex-display-as-mathblock
+         (org-conf--latex-display-fragment-p data))
+    (org-conf--mathblock (org-conf--strip-latex-display-delimiters data)))
+   (t
+    (format
+"\n<ac:structured-macro ac:name=\"mathinline\">
+  <ac:parameter ac:name=\"body\">%s</ac:parameter>
+</ac:structured-macro>\n"
+     ;; Remove guiding '\(' and trailing '\)'.
+     (replace-regexp-in-string "\\\\(\\|\\\\)" ""
+                               (org-html-encode-plain-text data))))))
+
+(defun org-conf-latex-environment-filter (data backend info)
+  "Function applied to a transcoded latex-environment."
+  (org-conf--mathblock data))
 
 (defun org-conf-export-block-filter (data backend info)
   "Transcode a EXPORT-BLOCK element from Org to HTML.
@@ -1561,6 +1625,14 @@ cannot produce a broken #+CONF_PAGE:."
 ;;; ======================================================================
 ;;;                          Request Methods
 ;;; ======================================================================
+
+(defcustom org-conf-rest-timeout 60
+  "Timeout in seconds for REST requests.
+Large pages can take a while to upload.  A short timeout can silently
+drop the request, especially in batch Emacs."
+  :type 'integer
+  :group 'org-export-conf)
+
 (defun org-conf-rest-get-page-json (conf-id)
   "Retrieve a Confluence page's status information using GET method."
   (request-response-data
@@ -1574,7 +1646,7 @@ cannot produce a broken #+CONF_PAGE:."
       ;; we make the data responses after "success".
       :parser 'json-read
       :sync t
-      :timeout 2
+      :timeout org-conf-rest-timeout
       :success (cl-function
                 (lambda (&key data &allow-other-keys)
                   (when data (message "Got Page!"))))
@@ -1592,7 +1664,7 @@ cannot produce a broken #+CONF_PAGE:."
        :auth "basic"
        :parser 'json-read
        :sync t
-       :timeout 10
+       :timeout org-conf-rest-timeout
        :success (cl-function
                  (lambda (&key data &allow-other-keys)
                    (when data (message "Got %s" api))))
@@ -1629,7 +1701,7 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
         :headers '(("Content-Type" . "application/json"))
         :parser 'json-read
         :sync t
-        :timeout 10
+        :timeout org-conf-rest-timeout
         :success (cl-function
                   (lambda (&key data &allow-other-keys)
                     (when data (message "Created page!"))))
@@ -1654,6 +1726,8 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
                 ("version" . (("number" . ,version)
                               ("message" . ,ver-msg)))))
        :headers '(("Content-Type" . "application/json"))
+       :sync t
+       :timeout org-conf-rest-timeout
        :success (cl-function
                  (lambda (&key data &allow-other-keys)
                    (message "Put Succeed!")))
@@ -1679,7 +1753,7 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
                (let ((json-object-type 'plist))
                  (json-read)))
       :sync t
-      :timeout 2
+      :timeout org-conf-rest-timeout
       :success (cl-function
                 (lambda (&key data &allow-other-keys)
                   (when data (message "Got Attachment(s)!"))))
@@ -1708,6 +1782,8 @@ PARENT-ID nil means the space root.  Return a (:id :webui) plist; a nil
        :files `(("file" . ,(expand-file-name filepath)))
        :user-defined-form '(("minorEdit" . "\"ture\""))
        :headers '(("X-Atlassian-Token" . "no-check"))
+       :sync t
+       :timeout org-conf-rest-timeout
        :success (cl-function
                  (lambda (&key data &allow-other-keys)
                    (message "Posted!")))
@@ -1874,8 +1950,29 @@ Keys: :id, :title, :version, :space, :parent-id, :ancestors and :url.
         "no error output"
       (or (ignore-errors
             (alist-get 'error
-                       (json-parse-string text :object-type 'alist)))
+                       (org-conf--json-parse-string text)))
           text))))
+
+(defun org-conf--json-parse-string (string)
+  "Parse STRING as JSON, with or without native JSON support.
+Prefers `json-parse-string' when available; older Emacsen (for example
+29.2 built without native JSON) fall back to the pure-Elisp `json-read'.
+Both paths produce alists with symbol keys, lists for arrays, and nil
+for null/false."
+  (if (fboundp 'json-parse-string)
+      (json-parse-string string
+                         :object-type 'alist
+                         :array-type 'list
+                         :null-object nil
+                         :false-object nil)
+    (with-temp-buffer
+      (insert string)
+      (goto-char (point-min))
+      (let ((json-object-type 'alist)
+            (json-array-type 'list)
+            (json-null nil)
+            (json-false nil))
+        (json-read)))))
 
 (defun org-conf--cli-json (&rest args)
   "Run the confluence CLI with ARGS and return the parsed JSON.
@@ -1906,13 +2003,7 @@ when the CLI exits non-zero or prints something that is not JSON."
                         (mapconcat #'identity args " ")
                         (org-conf--cli-error-message stderr)))
           (condition-case err
-              (with-temp-buffer
-                (insert output)
-                (goto-char (point-min))
-                (json-parse-buffer :object-type 'alist
-                                   :array-type 'list
-                                   :null-object nil
-                                   :false-object nil))
+              (org-conf--json-parse-string output)
             (error
              (user-error "confluence %s returned invalid JSON: %s"
                          (mapconcat #'identity args " ")
@@ -2056,7 +2147,8 @@ Ask for confirmation when an attachment with the same name exists."
                                 attachments)
                                :id)))
     (if attach-id
-        (when (y-or-n-p (format "Attachment '%s' already exists, replace?" filename))
+        (when (org-conf--confirm
+               (format "Attachment '%s' already exists, replace?" filename))
           (org-conf-backend-upload-attachment conf-id link attach-id))
       (org-conf-backend-upload-attachment conf-id link nil))))
 
@@ -2393,21 +2485,12 @@ A successful run with unparseable stdout yields code \"INVALID_JSON\"."
       (condition-case err
           (list :ok t
                 :data
-                (with-temp-buffer
-                  (insert output)
-                  (goto-char (point-min))
-                  (json-parse-buffer :object-type 'alist
-                                     :array-type 'list
-                                     :null-object nil
-                                     :false-object nil)))
+                (org-conf--json-parse-string output))
         (error (list :ok nil :status nil :code "INVALID_JSON"
                      :message (error-message-string err))))
     (let* ((text (string-trim stderr))
            (parsed (ignore-errors
-                     (json-parse-string text
-                                        :object-type 'alist
-                                        :null-object nil
-                                        :false-object nil))))
+                     (org-conf--json-parse-string text))))
       (list :ok nil
             :status (and (consp parsed) (alist-get 'status parsed))
             :code (and (consp parsed) (alist-get 'code parsed))
@@ -3238,7 +3321,8 @@ the local reply as `answered'; it never claims a remote resolution."
                        (truncate-string-to-width
                         (or (plist-get draft :body) "") 60)))
             (message "Dry run: %d reply/replies not posted" (length drafts)))
-           ((y-or-n-p (format "Post %d reply/replies to page %s? "
+           ((org-conf--confirm
+             (format "Post %d reply/replies to page %s? "
                               (length drafts) conf-id))
             (dolist (draft drafts)
               (org-conf--post-comment-reply conf-id draft))
@@ -3659,6 +3743,21 @@ uploaded.  Nothing is written when Confluence refuses the creation."
         (org-conf--export-to-conf
          org-conf--upload-attachments nil nil nil nil nil)))))
 
+(defcustom org-conf-default-version-message nil
+  "Version message used when Emacs is non-interactive.
+In batch, this value is used when set; nil means an empty version
+message.  Interactive Emacs always prompts, regardless of this value."
+  :type '(choice (const :tag "Empty message in batch" nil) string)
+  :group 'org-export-conf)
+
+(defun org-conf--version-message ()
+  "Return the version message for the current publish.
+Noninteractive Emacs never prompts: it uses
+`org-conf-default-version-message' when set, otherwise the empty string."
+  (if noninteractive
+      (or org-conf-default-version-message "")
+    (read-string "Version message: ")))
+
 (defun org-conf--export-to-conf
     (upload-attachments &optional async subtreep visible-only body-only ext-plist)
   "Export to Confluence; UPLOAD-ATTACHMENTS controls attachment uploads.
@@ -3683,7 +3782,7 @@ first."
                       #'org-conf-backend-get-page-info conf-id))
                (page-title (or (plist-get info :title)
                                (format "page %s" conf-id))))
-          (if (not (y-or-n-p
+          (if (not (org-conf--confirm
                     (format "Upload to 「%s」 (%s)? " page-title conf-id)))
               (cond
                (org-conf--just-created
@@ -3712,7 +3811,7 @@ first."
             ;; Keep inline comment anchors before touching the page.
             (setq output (org-conf--protect-publish-output conf-id output))
             ;; Update the page!
-            (setq ver-msg (read-string "Version message: "))
+            (setq ver-msg (org-conf--version-message))
             (when (org-conf-backend-update-page
                    conf-id title conf-space output version ver-msg)
               (org-conf--maybe-adopt-after-publish))))

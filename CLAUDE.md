@@ -222,7 +222,9 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (258 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (274 tests) in `test/ox-conf-test.el`. It loads `ox-conf.el`
+explicitly rather than via `require`, so a stale `ox-conf.elc` is never tested.
+The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement,
 old-page comment retention, the drill-down decision table, backend selection and
@@ -246,7 +248,12 @@ status, sidecar rendering with preserved `answered`, org body escaping, storage
 conversion, draft detection and reply write-back), and the export layer
 (src-block language mapping including asm/rs and the three Jira macro paths,
 special blocks and their defaults, headline numbering, TOC, tag colours, LaTeX
-and export-block filters, external/file/image links, targets and center blocks).
+and export-block filters, external/file/image links, targets and center blocks),
+and batch-mode fixes (synchronous REST PUT/POST argument checks, the
+noninteractive version message, auto-confirmation in batch, display LaTeX
+promoting to `mathblock`, and JSON parsing through the `json-parse-string` /
+`json-read` fallback). The suite is run on both Emacs 31 and Emacs 29.1 (no
+native JSON) before release.
 `ox-conf-test--export' drives the real exporter on a temp org buffer, so element
 parsing and transcoding are exercised together.
 `org-conf-create-page-and-export`, `org-conf--read-parent-by-drill-down` and
@@ -289,6 +296,10 @@ The entire backend lives in a single file. Its structure:
 - `org-conf-canonical-dropped-attributes` — attributes removed from the ediff projection (default `ac:macro-id`, `ac:schema-version`)
 - `org-conf-marker-loss-policy` — `error` (default) / `warn` / `allow` when publishing would drop inline anchors
 - `org-conf-comments-directory` — comments sidecar base directory (`nil` = `.conf-comments` next to the org file)
+- `org-conf-rest-timeout` — REST request timeout in seconds (default 60)
+- `org-conf-default-version-message` — version message used in noninteractive exports (`nil` = empty message; interactive always prompts)
+- `org-conf-batch-assume-yes` — noninteractive exports auto-confirm prompts (default `t`; `nil` keeps the prompt)
+- `org-conf-latex-display-as-mathblock` — promote `\[ … \]` fragments to `mathblock` (default `t`)
 
 ### 2. Template layer
 `org-conf-template` (outer wrapper), `org-conf-inner-template` (prepends TOC, appends footnotes), `org-conf-headline` (wraps in `numberedheadings` macro when `#+OPTIONS: num:t`), `org-conf-toc` (generates `ac:toc` macro), and `org-conf--tags` (maps Chinese tags to Confluence status macros colored Green/Yellow/Red/Blue).
@@ -304,7 +315,7 @@ Override specific elements from `ox-html`. The most complex is `org-conf-special
 `org-conf-src-block` has three paths: Jira issue queries (`jira` language), Jira charts (`jirachart-pie` / `jirachart-2d`), and standard code blocks (maps Org src languages to Confluence code macro language IDs; special-cases `asm` → `c`, `rs` → `bash` with a host/path prompt comment).
 
 ### 4. Filters (`:filters-alist`)
-- `org-conf-latex-fragment-filter` — wraps inline LaTeX in `mathinline` macro
+- `org-conf-latex-fragment-filter` — wraps inline LaTeX in `mathinline`; a `\[ … \]` display fragment is promoted to `mathblock` when `org-conf-latex-display-as-mathblock` is non-nil (default)
 - `org-conf-latex-environment-filter` — wraps display LaTeX in `mathblock` macro
 - `org-conf-export-block-filter` — wraps raw HTML export blocks in an `html` macro with CDATA
 
@@ -320,6 +331,7 @@ REST implementation (synchronous, uses the `request` library):
 - `org-conf-rest-put` — PUT updated page content as JSON (body in storage format)
 - `org-conf-rest-get-attach-json` — GET attachment list (parsed as plist)
 - `org-conf-rest-post-file` — POST new attachments or update existing ones (`X-Atlassian-Token: no-check` header)
+- `org-conf-rest-put` / `org-conf-rest-post-file` pass `:sync t`, so `emacs --batch` waits for the request instead of exiting early; `org-conf-rest-timeout` (default 60s) bounds every REST call. `org-conf-default-version-message` replaces the interactive version prompt when `noninteractive`.
 - `org-conf--rest-get-json` — generic authenticated GET returning parsed JSON (or nil on failure)
 - `org-conf-rest-get-page-node` — GET a page's `(:id :title)`
 - `org-conf-rest-get-children` — GET a page's direct children, paginating via `_links.next`
@@ -331,7 +343,10 @@ REST implementation (synchronous, uses the `request` library):
 
 CLI implementation (`confluence` 2.29.0, `--json` output):
 - `org-conf--cli-json` — runs `confluence --json …` via `call-process`, captures
-  stderr in a temp file, and raises `user-error` on non-zero exit or invalid JSON
+  stderr in a temp file, and raises `user-error` on non-zero exit or invalid JSON.
+  It parses through `org-conf--json-parse-string`, which prefers
+  `json-parse-string` and falls back to pure-Elisp `json-read` on Emacs builds
+  without native JSON (29.1/29.2).
 - `org-conf--cli-invoke` — applies `org-conf--cli-json-function`, the rebindable
   transport seam
 - `org-conf--with-temp-body` — writes UTF-8 page bodies to a temp file for `--file`
