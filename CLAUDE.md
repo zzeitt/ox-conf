@@ -222,7 +222,9 @@ emacs -Q --batch -L test -l test/run-tests.el
 ```
 
 `test/run-tests.el` bootstraps `load-path` (adding `~/elpa` for `request`) and runs
-the ERT suite (273 tests) in `test/ox-conf-test.el`. The suite covers the pure
+the ERT suite (274 tests) in `test/ox-conf-test.el`. It loads `ox-conf.el`
+explicitly rather than via `require`, so a stale `ox-conf.elc` is never tested.
+The suite covers the pure
 helpers — path building, frequency sorting/persistence, grouped and flat JSON
 parsing, the POST payload, BFS collection, shebang-aware keyword placement,
 old-page comment retention, the drill-down decision table, backend selection and

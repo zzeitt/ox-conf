@@ -23,7 +23,8 @@
 (add-to-list 'load-path ox-conf--root-dir)
 
 (require 'ert)
-(require 'ox-conf)
+;; Load the source explicitly: `require' would prefer a stale ox-conf.elc.
+(load (expand-file-name "ox-conf.el" ox-conf--root-dir) nil t)
 ;; Keep the suite's debug log out of the user's real *ox-conf-log* buffer.
 (setq org-conf-log-buffer-name " *ox-conf-test-log*")
 (load (expand-file-name "ox-conf-test.el" ox-conf--test-dir) nil t)

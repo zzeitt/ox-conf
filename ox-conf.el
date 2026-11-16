@@ -2490,10 +2490,7 @@ A successful run with unparseable stdout yields code \"INVALID_JSON\"."
                      :message (error-message-string err))))
     (let* ((text (string-trim stderr))
            (parsed (ignore-errors
-                     (json-parse-string text
-                                        :object-type 'alist
-                                        :null-object nil
-                                        :false-object nil))))
+                     (org-conf--json-parse-string text))))
       (list :ok nil
             :status (and (consp parsed) (alist-get 'status parsed))
             :code (and (consp parsed) (alist-get 'code parsed))

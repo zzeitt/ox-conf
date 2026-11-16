@@ -610,7 +610,11 @@
           (ox-conf-test--reset-parent-caches)
           (with-temp-buffer
             (setq buffer-file-name file)
-            (cl-letf (((symbol-function 'org-conf-backend-search-pages)
+            (cl-letf (((symbol-function 'org-conf--org-files-near)
+                       ;; The climb walks above BASE into the real temp
+                       ;; directory; keep this test hermetic.
+                       (lambda (_dir) nil))
+                      ((symbol-function 'org-conf-backend-search-pages)
                        (lambda (_space query)
                          (should (equal "vml" query))
                          '((:id "9" :title "perf_vml.csv" :type "attachment")
@@ -3092,6 +3096,17 @@ disabled so the test never touches Confluence."
                  (insert "{\"id\":\"7\"}"))
                0)))
     (should (equal '((id . "7")) (org-conf--cli-json "info" "7")))))
+
+(ert-deftest ox-conf-test-cli-parse-result-error-branch-works-without-native-json ()
+  "The stderr branch must also use the fallback parser."
+  (cl-letf (((symbol-function 'json-parse-buffer) nil)
+            ((symbol-function 'json-parse-string) nil))
+    (should (equal '(:ok nil :status 404 :code "NOT_FOUND"
+                     :message "Request failed with status code 404")
+                   (org-conf--cli-parse-result
+                    1 ""
+                    (concat "{\"error\":\"Request failed with status code 404\","
+                            "\"code\":\"NOT_FOUND\",\"status\":404}"))))))
 
 (ert-deftest ox-conf-test-cli-error-message-works-without-native-json ()
   (let ((file (make-temp-file "ox-conf-err" nil ".json")))
